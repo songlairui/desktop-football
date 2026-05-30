@@ -14,12 +14,16 @@ let package = Package(
             path: "Sources/FootballPhysics",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
-        // The AppKit app: window-is-the-ball, CVDisplayLink-driven, CALayer-rendered.
+        // The AppKit app: full-screen transparent Metal scene, CVDisplayLink-driven.
         .executableTarget(
             name: "DesktopFootball",
             dependencies: ["FootballPhysics"],
             path: "Sources/DesktopFootball",
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            swiftSettings: [.swiftLanguageMode(.v5)],
+            linkerSettings: [
+                .linkedFramework("MetalKit"),
+                .linkedFramework("ModelIO"),
+            ]
         ),
         .testTarget(
             name: "FootballPhysicsTests",

@@ -2,11 +2,8 @@ import AppKit
 import CoreVideo
 import FootballPhysics
 
-/// The desktop football window. The **window itself is the ball**: a small
-/// transparent panel that the physics engine walks around the screen by moving
-/// its origin every frame (the same CVDisplayLink + `setFrameOrigin` model
-/// `HUDPanel` proved out). The ball graphic, shadow and deformation live inside
-/// the window via `FootballLayerView`.
+/// The desktop football window. A full-screen transparent panel hosts the Metal
+/// scene while the physics engine still tracks the ball in screen coordinates.
 ///
 /// Mouse model:
 ///   • A global cursor poll each frame drives the kick/airflow field — this works
@@ -18,9 +15,8 @@ import FootballPhysics
 final class FootballPanel: NSPanel {
 
     // MARK: Geometry
-    private let windowSize = NSSize(width: 170, height: 170)
-    private let ballAnchor = CGPoint(x: 85, y: 100)
-    private let liftRange: CGFloat = 380
+    /// The screen-sized frame currently occupied by the transparent Metal overlay.
+    private var overlayFrame: NSRect
 
     // MARK: Model
     private var config = PhysicsConfig.standard
@@ -29,10 +25,11 @@ final class FootballPanel: NSPanel {
     private(set) var gravityMode: GravityMode = .normal
 
     // MARK: Infra
-    private let ballView: FootballLayerView
+    private let ballView: FootballMetalView   // changed from FootballLayerView
     private let sound = SoundEngine()
 
     private var displayLink: CVDisplayLink?
+    private let framePermit = DispatchSemaphore(value: 1)
     private var lastStepTime: CFTimeInterval = 0
     private var prevMouse = NSEvent.mouseLocation
     private var lastKickAt: CFTimeInterval = 0
@@ -73,16 +70,21 @@ final class FootballPanel: NSPanel {
     // MARK: - Init
 
     init() {
-        let screen = NSScreen.main ?? NSScreen.screens.first
-        let vis = screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let initialFrame = screen?.frame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let vis = screen?.visibleFrame ?? initialFrame
         bounds = Bounds(rect: vis)
         ball = BallState.resting(atX: vis.midX, bounds: bounds, config: config)
+        overlayFrame = initialFrame
 
-        ballView = FootballLayerView(windowSize: windowSize, diameter: config.radius * 2,
-                                     ballAnchor: ballAnchor, liftRange: liftRange)
+        guard let scene = MetalScene() else { fatalError("Metal not available") }
+        ballView = FootballMetalView(frame: NSRect(origin: .zero, size: initialFrame.size), scene: scene)
 
         super.init(
-            contentRect: NSRect(origin: .zero, size: windowSize),
+            contentRect: initialFrame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
@@ -91,8 +93,10 @@ final class FootballPanel: NSPanel {
         backgroundColor = .clear
         isOpaque = false
         hasShadow = false
+        ignoresMouseEvents = true
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         isMovableByWindowBackground = false
+        ballView.autoresizingMask = [.width, .height]
         contentView = ballView
 
         syncWindowToBall()
@@ -182,6 +186,8 @@ final class FootballPanel: NSPanel {
     // MARK: - Lifecycle
 
     override func orderFrontRegardless() {
+        ignoresMouseEvents = true
+        interactive = false
         super.orderFrontRegardless()
         prevMouse = NSEvent.mouseLocation
         startLoop()
@@ -199,22 +205,27 @@ final class FootballPanel: NSPanel {
         CVDisplayLinkCreateWithActiveCGDisplays(&displayLink)
         guard let dl = displayLink else { return }
 
-        // The output handler runs on CVDisplayLink's own real-time thread. To avoid
-        // a data race on stepPending/lastStepTime (accessed only from main), we
-        // immediately hop to main and do all bookkeeping there.
-        CVDisplayLinkSetOutputHandler(dl) { [weak self] _, _, _, _, _ in
-            DispatchQueue.main.async { self?.onDisplayTick() }
+        // The output handler runs on CVDisplayLink's own real-time thread. Keep
+        // at most one pending main-thread frame; otherwise menu tracking can be
+        // starved by queued render ticks, and CAMetalLayer.nextDrawable can beachball.
+        CVDisplayLinkSetOutputHandler(dl) { [weak self, framePermit] _, _, _, _, _ in
+            guard framePermit.wait(timeout: .now()) == .success else {
+                return kCVReturnSuccess
+            }
+            DispatchQueue.main.async { [weak self, framePermit] in
+                defer { framePermit.signal() }
+                self?.onDisplayTick()
+            }
             return kCVReturnSuccess
         }
         CVDisplayLinkStart(dl)
     }
 
-    /// Runs on main. Uses the dispatch-queue coalescing inherent in
-    /// `DispatchQueue.main.async` to skip redundant frames — if the previous async
-    /// block hasn't executed yet (i.e. main is busy), the queue merges them by
-    /// virtue of us just enqueueing another block. The `CACurrentMediaTime()` snapshot
-    /// taken here is always fresh when the block actually runs.
+    /// Runs on main. Skips menu tracking loops so status bar menus remain responsive.
     private func onDisplayTick() {
+        if RunLoop.current.currentMode == .eventTracking {
+            return
+        }
         let now = CACurrentMediaTime()
         let dt: CGFloat = lastStepTime == 0 ? 1.0 / 60.0 : CGFloat(now - lastStepTime)
         lastStepTime = now
@@ -359,16 +370,23 @@ final class FootballPanel: NSPanel {
         return bounds.clampCenter(raw, radius: config.radius)
     }
 
-    /// Move the window so the ball graphic lands on `ball.center`, then render.
+    /// Push the current ball state to the Metal scene. The window no longer moves —
+    /// the 3D camera and projection handle positioning.
     private func syncWindowToBall() {
-        setFrameOrigin(NSPoint(x: ball.center.x - ballAnchor.x,
-                               y: ball.center.y - ballAnchor.y))
-        let floorY = bounds.floorY(radius: config.radius)
-        let lift = max(0, min(1, (ball.center.y - floorY) / liftRange))
-        ballView.render(angle: ball.angle, squash: ball.squash,
-                        liftFactor: lift,
-                        motionState: ball.motionState(config: config, bounds: bounds),
-                        chargeFraction: chargeFraction)
+        syncOverlayFrameToBall()
+        ballView.render(ballState: ball, config: config, bounds: bounds)
+    }
+
+    private func syncOverlayFrameToBall() {
+        let target = overlayWindowFrame(containing: ball.center)
+        guard target != overlayFrame else { return }
+        overlayFrame = target
+        setFrame(target, display: true)
+        ballView.frame = NSRect(origin: .zero, size: target.size)
+    }
+
+    private func overlayWindowFrame(containing point: CGPoint) -> NSRect {
+        screen(containing: point)?.frame ?? overlayFrame
     }
 
     /// Capture clicks only while the cursor is over the ball; otherwise let the
@@ -387,10 +405,8 @@ final class FootballPanel: NSPanel {
         } else {
             nowInteractive = d <= config.radius * 1.15  // enter radius (smaller)
         }
-        if nowInteractive != interactive {
-            interactive = nowInteractive
-            ignoresMouseEvents = !nowInteractive
-        }
+        interactive = nowInteractive
+        ignoresMouseEvents = !nowInteractive
     }
 
     /// The union of every screen's visible frame — used only while the ball is
@@ -408,14 +424,19 @@ final class FootballPanel: NSPanel {
     /// gap between displays (or off them all) we fall back to the nearest screen so
     /// the ball is pulled back onto a real display rather than lost in the void.
     private func screenBounds(containing point: CGPoint) -> Bounds {
+        guard let screen = screen(containing: point) else { return bounds }
+        return Bounds(rect: screen.visibleFrame)
+    }
+
+    private func screen(containing point: CGPoint) -> NSScreen? {
         let screens = NSScreen.screens
-        guard !screens.isEmpty else { return bounds }
+        guard !screens.isEmpty else { return nil }
         if let onScreen = screens.first(where: { $0.frame.contains(point) }) {
-            return Bounds(rect: onScreen.visibleFrame)
+            return onScreen
         }
         let nearest = screens.min { Self.squaredDistance(from: point, to: $0.frame)
                                   < Self.squaredDistance(from: point, to: $1.frame) }
-        return Bounds(rect: (nearest ?? screens[0]).visibleFrame)
+        return nearest ?? screens[0]
     }
 
     /// Squared distance from a point to the nearest edge/inside of a rect.
@@ -497,7 +518,6 @@ final class FootballPanel: NSPanel {
         }
         ball.squash = min(config.maxSquash, ball.squash + 0.25 * multiplier / 4.0)
         sound.playKick(strength: impulse * 0.75)
-        ballView.playChargeRelease(multiplier: multiplier)
         EffectsOverlayPanel.shared.showStrikeEffect(at: ball.center, power: multiplier / 4.0 * 1.5)
     }
 
@@ -524,10 +544,19 @@ final class FootballPanel: NSPanel {
     // MARK: - Mouse
 
     override func mouseDown(with event: NSEvent) {
+        let m = NSEvent.mouseLocation
+        guard ball.isGrabbed || ball.isSnapped || distanceFromBall(m) <= config.radius * 1.5 else {
+            interactive = false
+            ignoresMouseEvents = true
+            return
+        }
         didDrag = false
         ball.velocity = .zero                       // "catch" the ball
-        let m = NSEvent.mouseLocation
         grabOffset = CGPoint(x: ball.center.x - m.x, y: ball.center.y - m.y)
+    }
+
+    private func distanceFromBall(_ point: NSPoint) -> CGFloat {
+        hypot(point.x - ball.center.x, point.y - ball.center.y)
     }
 
     override func mouseDragged(with event: NSEvent) {

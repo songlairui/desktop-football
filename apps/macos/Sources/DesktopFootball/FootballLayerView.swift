@@ -84,7 +84,7 @@ final class FootballLayerView: NSView {
         // Subtle perspective: a little larger when flying up ("toward the viewer").
         let perspective = 1 + 0.05 * liftFactor
 
-        let sx = (1 + squash * 0.55) * perspective * breathe
+        let sx = (1 + squash * 0.75) * perspective * breathe
         let sy = (1 - squash) * perspective * breathe
         ballContainer.transform = CATransform3DMakeScale(sx, sy, 1)
 

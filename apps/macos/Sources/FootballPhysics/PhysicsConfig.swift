@@ -11,6 +11,10 @@ import CoreGraphics
 /// mutating an existing config.
 public struct PhysicsConfig: Equatable, Sendable {
 
+    /// The real-world gravity baseline (pt/s², negative because +Y is up). Shared
+    /// so `GravityMode.normal` and the default config never drift apart.
+    public static let normalGravity: CGFloat = -2000
+
     // MARK: Geometry
 
     /// Ball radius in points. The visible diameter is `2 * radius`.
@@ -18,7 +22,8 @@ public struct PhysicsConfig: Equatable, Sendable {
 
     // MARK: Gravity & damping
 
-    /// Downward acceleration in pt/s². Negative because +Y is up.
+    /// Vertical acceleration in pt/s². Negative falls down, positive floats up
+    /// (balloon mode), zero is weightless. Driven by the active `GravityMode`.
     ///
     /// The PRD lists -980 ("close to real gravity") but that reads as floaty at
     /// screen scale where 1pt is tiny; we use a livelier default and keep it
@@ -29,8 +34,8 @@ public struct PhysicsConfig: Equatable, Sendable {
     /// `pow`). `1.0` = no drag; `< 1` bleeds speed while airborne.
     public var airDamping60: CGFloat
 
-    /// Rolling resistance multiplier per 1/60 s while the ball touches the ground.
-    /// Lower = the ball stops sooner. Applied to the horizontal component only.
+    /// Rolling resistance multiplier per 1/60 s while the ball touches the surface
+    /// it rests against. Lower = the ball stops sooner. Horizontal component only.
     public var rollingResistance60: CGFloat
 
     // MARK: Collisions
@@ -38,11 +43,11 @@ public struct PhysicsConfig: Equatable, Sendable {
     /// Fraction of normal-velocity kept after a wall/ground bounce (0…1).
     public var restitution: CGFloat
 
-    /// Below this speed at ground contact the vertical bounce is cancelled and the
-    /// ball is considered resting (prevents infinite micro-bounces).
+    /// Below this speed at surface contact the bounce is cancelled and the ball is
+    /// considered resting (prevents infinite micro-bounces on floor or ceiling).
     public var bounceCutoff: CGFloat
 
-    /// Below this total speed while grounded the ball is put to sleep (vel = 0),
+    /// Below this total speed while resting the ball is put to sleep (vel = 0),
     /// so it can settle to a clean stop and start the idle breathing animation.
     public var sleepSpeed: CGFloat
 
@@ -70,6 +75,31 @@ public struct PhysicsConfig: Equatable, Sendable {
     /// sound / particles — distinguishes a deliberate swipe from idle drift.
     public var swipeSoundThreshold: CGFloat
 
+    // MARK: Snap-to-cursor (right Option)
+
+    /// Spring stiffness (1/s²) pulling the ball toward the point below the cursor
+    /// while right Option is held. Higher = the ball tracks the cursor more tightly.
+    public var snapStiffness: CGFloat
+
+    /// Velocity damping multiplier per 1/60 s applied during snap, tuned near
+    /// critical so the ball settles under the cursor without ringing.
+    public var snapDamping60: CGFloat
+
+    /// How far (pt) the ball centre sits *below* the cursor when snapped, so the
+    /// cursor stays visible just above the ball.
+    public var snapCursorOffset: CGFloat
+
+    /// Distance (pt) between the ball and its target below the cursor beyond which
+    /// the snap breaks and the ball falls back into collision mode — whether the
+    /// cursor moved away too fast or gravity dragged the ball off.
+    public var snapBreakDistance: CGFloat
+
+    /// While right Option stays held after a break, the ball re-snaps once the
+    /// cursor comes back within this distance (pt) of it. Kept below
+    /// `snapBreakDistance` so there is hysteresis: a flick still throws the ball
+    /// clear, but deliberately moving the cursor back onto it re-grabs it.
+    public var snapCaptureDistance: CGFloat
+
     // MARK: Deformation
 
     /// Maximum squash amount (0…1) at the hardest landing. `0.4` ≈ 40% flatter.
@@ -84,7 +114,7 @@ public struct PhysicsConfig: Equatable, Sendable {
 
     public init(
         radius: CGFloat = 30,
-        gravityY: CGFloat = -2000,
+        gravityY: CGFloat = PhysicsConfig.normalGravity,
         airDamping60: CGFloat = 0.999,
         rollingResistance60: CGFloat = 0.95,
         restitution: CGFloat = 0.58,
@@ -92,13 +122,18 @@ public struct PhysicsConfig: Equatable, Sendable {
         sleepSpeed: CGFloat = 14,
         maxSpeed: CGFloat = 6000,
         kickRadius: CGFloat = 95,
-        kickGain: CGFloat = 70,
+        kickGain: CGFloat = 130,
         hoverForce: CGFloat = 220,
         clickImpulse: CGFloat = 950,
         swipeSoundThreshold: CGFloat = 600,
-        maxSquash: CGFloat = 0.40,
-        squashReference: CGFloat = 2200,
-        squashRecovery60: CGFloat = 0.80
+        snapStiffness: CGFloat = 200,
+        snapDamping60: CGFloat = 0.72,
+        snapCursorOffset: CGFloat = 42,
+        snapBreakDistance: CGFloat = 85,
+        snapCaptureDistance: CGFloat = 55,
+        maxSquash: CGFloat = 0.55,
+        squashReference: CGFloat = 1700,
+        squashRecovery60: CGFloat = 0.82
     ) {
         self.radius = radius
         self.gravityY = gravityY
@@ -113,6 +148,11 @@ public struct PhysicsConfig: Equatable, Sendable {
         self.hoverForce = hoverForce
         self.clickImpulse = clickImpulse
         self.swipeSoundThreshold = swipeSoundThreshold
+        self.snapStiffness = snapStiffness
+        self.snapDamping60 = snapDamping60
+        self.snapCursorOffset = snapCursorOffset
+        self.snapBreakDistance = snapBreakDistance
+        self.snapCaptureDistance = snapCaptureDistance
         self.maxSquash = maxSquash
         self.squashReference = squashReference
         self.squashRecovery60 = squashRecovery60

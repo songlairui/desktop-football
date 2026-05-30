@@ -23,6 +23,10 @@ public struct BallState: Equatable, Sendable {
     public var squash: CGFloat
     /// True while the cursor is dragging the ball (gravity suspended).
     public var isGrabbed: Bool
+    /// True while the ball is snapped below the cursor (right Option). A soft
+    /// spring holds it under the cursor while gravity still tugs; it breaks back
+    /// into free physics once it strays past `snapBreakDistance`.
+    public var isSnapped: Bool
 
     public init(
         center: CGPoint,
@@ -30,7 +34,8 @@ public struct BallState: Equatable, Sendable {
         angle: CGFloat = 0,
         angularVelocity: CGFloat = 0,
         squash: CGFloat = 0,
-        isGrabbed: Bool = false
+        isGrabbed: Bool = false,
+        isSnapped: Bool = false
     ) {
         self.center = center
         self.velocity = velocity
@@ -38,6 +43,7 @@ public struct BallState: Equatable, Sendable {
         self.angularVelocity = angularVelocity
         self.squash = squash
         self.isGrabbed = isGrabbed
+        self.isSnapped = isSnapped
     }
 
     /// A ball sitting still on the ground at horizontal position `x`.
@@ -54,10 +60,26 @@ public struct BallState: Equatable, Sendable {
         center.y <= bounds.floorY(radius: config.radius) + Self.groundTolerance
     }
 
+    /// Whether the ball is pressed against the ceiling (the resting surface in
+    /// balloon / anti-gravity mode).
+    public func isCeiled(config: PhysicsConfig, bounds: Bounds) -> Bool {
+        center.y >= bounds.ceilingY(radius: config.radius) - Self.groundTolerance
+    }
+
+    /// Whether the ball is settled against the surface gravity pulls it toward —
+    /// the floor under normal gravity, the ceiling in balloon mode, or either when
+    /// weightless. Drives sleeping, rolling resistance and the idle animation so
+    /// they work the same in every gravity world.
+    public func isResting(config: PhysicsConfig, bounds: Bounds) -> Bool {
+        if config.gravityY < 0 { return isGrounded(config: config, bounds: bounds) }
+        if config.gravityY > 0 { return isCeiled(config: config, bounds: bounds) }
+        return isGrounded(config: config, bounds: bounds) || isCeiled(config: config, bounds: bounds)
+    }
+
     /// Coarse motion classification for the renderer / sound layer.
     public func motionState(config: PhysicsConfig, bounds: Bounds) -> MotionState {
-        if isGrabbed { return .grabbed }
-        if !isGrounded(config: config, bounds: bounds) || abs(velocity.y) > config.bounceCutoff {
+        if isGrabbed || isSnapped { return .grabbed }
+        if !isResting(config: config, bounds: bounds) || abs(velocity.y) > config.bounceCutoff {
             return .flying
         }
         let rollThreshold = config.sleepSpeed * 1.5
@@ -82,17 +104,18 @@ public struct BallState: Equatable, Sendable {
         // Last frame's squash relaxes toward round; a fresh impact below overrides.
         squash *= pow(config.squashRecovery60, dt * 60.0)
 
-        let groundedAtStart = isGrounded(config: config, bounds: bounds)
+        let restingAtStart = isResting(config: config, bounds: bounds)
 
         // 1. Accelerate: gravity (vertical) + mouse field (both axes).
         velocity.x += fieldForce.x * dt
         velocity.y += (config.gravityY + fieldForce.y) * dt
 
-        // 2. Damping. Air drag always; rolling resistance only while grounded.
+        // 2. Damping. Air drag always; rolling resistance only while resting on a
+        //    surface (floor under gravity, ceiling under balloon mode).
         let airDecay = pow(config.airDamping60, dt * 60.0)
         velocity.x *= airDecay
         velocity.y *= airDecay
-        if groundedAtStart {
+        if restingAtStart {
             velocity.x *= pow(config.rollingResistance60, dt * 60.0)
         }
 
@@ -105,8 +128,9 @@ public struct BallState: Equatable, Sendable {
         // 4. Resolve collisions with the four walls + floor.
         resolveCollisions(bounds: bounds, config: config, events: &events)
 
-        // 5. Settle: a slow grounded ball is put fully to sleep for a clean stop.
-        if isGrounded(config: config, bounds: bounds),
+        // 5. Settle: a slow ball resting against its surface is put fully to sleep
+        //    for a clean stop (floor under gravity, ceiling under balloon mode).
+        if isResting(config: config, bounds: bounds),
            hypot(velocity.x, velocity.y) < config.sleepSpeed {
             velocity = .zero
         }
@@ -134,6 +158,50 @@ public struct BallState: Equatable, Sendable {
         center = clamped
         squash *= pow(config.squashRecovery60, dt * 60.0)
         updateSpin(dt: dt, config: config)
+    }
+
+    /// Hold the ball below the cursor while right Option is pressed.
+    ///
+    /// A spring pulls the ball toward `target` (the point below the cursor) while
+    /// gravity keeps tugging, so the ball hangs just under the cursor and follows
+    /// it. The attachment is *soft*: if the cursor outruns the spring, or gravity
+    /// drags the ball off, the ball strays past `snapBreakDistance`, `isSnapped`
+    /// flips to `false`, and the caller hands it back to free physics with the
+    /// velocity it had built up.
+    ///
+    /// - Returns: whether the ball is still snapped after this step.
+    @discardableResult
+    public mutating func snapStep(
+        target: CGPoint,
+        dt: CGFloat,
+        bounds: Bounds,
+        config: PhysicsConfig
+    ) -> Bool {
+        guard dt > 0 else { return isSnapped }
+
+        let dx = target.x - center.x
+        let dy = target.y - center.y
+
+        // Spring toward the cursor + the ambient gravity of the active mode.
+        velocity.x += dx * config.snapStiffness * dt
+        velocity.y += (dy * config.snapStiffness + config.gravityY) * dt
+
+        let decay = pow(config.snapDamping60, dt * 60.0)
+        velocity.x *= decay
+        velocity.y *= decay
+        clampSpeed(to: config.maxSpeed)
+
+        center.x += velocity.x * dt
+        center.y += velocity.y * dt
+        center = bounds.clampCenter(center, radius: config.radius)
+
+        squash *= pow(config.squashRecovery60, dt * 60.0)
+        updateSpin(dt: dt, config: config)
+
+        if hypot(target.x - center.x, target.y - center.y) > config.snapBreakDistance {
+            isSnapped = false
+        }
+        return isSnapped
     }
 
     /// A click "dribble": pop the ball straight up.
@@ -167,26 +235,41 @@ public struct BallState: Equatable, Sendable {
         let minX = bounds.minX(radius: config.radius)
         let maxX = bounds.maxX(radius: config.radius)
 
-        // Floor — the only surface that triggers landing squash + landing sound.
+        // The surface gravity pulls the ball onto is the "landing" surface (full
+        // landing squash + sound); the opposite is just a wall bounce. Under
+        // normal/zero gravity that's the floor; in balloon mode it's the ceiling.
+        let floorIsLanding = config.gravityY <= 0
+
+        // Floor.
         if center.y < floorY {
             let impact = abs(velocity.y)
             center.y = floorY
             if impact > config.bounceCutoff {
                 velocity.y = impact * config.restitution
-                events.landed = impact
                 let amount = config.maxSquash * min(1, impact / config.squashReference)
                 squash = max(squash, amount)
+                if floorIsLanding { events.landed = max(events.landed ?? 0, impact) }
+                else { events.hitWall = max(events.hitWall ?? 0, impact) }
             } else {
                 velocity.y = 0
             }
         }
 
-        // Ceiling.
+        // Ceiling — mirrors the floor so balloon mode can settle against the top
+        // instead of jittering: a soft touch is cancelled, a hard one bounces and
+        // squashes. In balloon mode this is the landing surface.
         if center.y > ceilY {
             let impact = abs(velocity.y)
             center.y = ceilY
-            velocity.y = -impact * config.restitution
-            if impact > config.bounceCutoff { events.hitWall = max(events.hitWall ?? 0, impact) }
+            if impact > config.bounceCutoff {
+                velocity.y = -impact * config.restitution
+                let amount = config.maxSquash * min(1, impact / config.squashReference)
+                squash = max(squash, amount)
+                if floorIsLanding { events.hitWall = max(events.hitWall ?? 0, impact) }
+                else { events.landed = max(events.landed ?? 0, impact) }
+            } else {
+                velocity.y = 0
+            }
         }
 
         // Left / right walls.

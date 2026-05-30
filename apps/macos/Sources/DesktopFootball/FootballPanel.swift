@@ -23,9 +23,10 @@ final class FootballPanel: NSPanel {
     private let liftRange: CGFloat = 380
 
     // MARK: Model
-    private let config = PhysicsConfig.standard
+    private var config = PhysicsConfig.standard
     private var ball: BallState
     private var bounds: Bounds
+    private(set) var gravityMode: GravityMode = .normal
 
     // MARK: Infra
     private let ballView: FootballLayerView
@@ -40,6 +41,12 @@ final class FootballPanel: NSPanel {
     private var didDrag = false
     private var grabOffset = CGPoint.zero
     private var interactive = false
+
+    /// kVK_RightOption — the modifier that snaps the ball to the cursor.
+    private let rightOptionKeyCode: CGKeyCode = 61
+    /// Rising-edge tracker so the snap only re-arms after the key is released, not
+    /// every frame the key stays held once the ball has broken away.
+    private var wasSnapHeld = false
 
     // MARK: - Init
 
@@ -78,11 +85,21 @@ final class FootballPanel: NSPanel {
         set { sound.isEnabled = newValue }
     }
 
-    /// Drop the ball back to the centre of the current screen.
+    /// Drop the ball back to the centre of the screen it is currently on.
     func reset() {
-        bounds = currentBounds()
+        bounds = screenBounds(containing: ball.center)
         ball = BallState.resting(atX: bounds.rect.midX, bounds: bounds, config: config)
         syncWindowToBall()
+    }
+
+    /// Switch the gravity world (normal / zero / balloon). The ball wakes up so it
+    /// immediately responds to the new gravity instead of staying asleep.
+    func setGravityMode(_ mode: GravityMode) {
+        gravityMode = mode
+        config.gravityY = mode.gravityY
+        config.airDamping60 = mode.airDamping60   // weightless mode drags harder
+        ball.isSnapped = false
+        sound.setRollSpeed(0)                     // silence rolling audio across the transition
     }
 
     // MARK: - Lifecycle
@@ -134,16 +151,47 @@ final class FootballPanel: NSPanel {
     // MARK: - Per-frame update
 
     private func tick(dt: CGFloat, now: CFTimeInterval) {
-        bounds = currentBounds()
         let mouse = NSEvent.mouseLocation
         let mVel = CGPoint(x: (mouse.x - prevMouse.x) / dt, y: (mouse.y - prevMouse.y) / dt)
         prevMouse = mouse
 
+        let snapHeld = isRightOptionDown()
+        let snapPressed = snapHeld && !wasSnapHeld
+        wasSnapHeld = snapHeld
+
+        // Bounds policy: while the ball is being carried — dragged, or shepherded
+        // with right Option held — it may cross between displays (union of all
+        // screens). Once let go it is confined to whichever screen it now sits on,
+        // so each display keeps its own edges and the boundary bites immediately.
+        let roaming = ball.isGrabbed || snapHeld
+        bounds = roaming ? roamingBounds() : screenBounds(containing: ball.center)
+
+        // Decide whether the ball should be snapped this frame. A fresh press
+        // (rising edge) always summons the ball, however far away it is. While the
+        // key stays held it keeps following; if it broke away, it re-snaps only
+        // once the cursor comes back within the (smaller) capture distance — so a
+        // flick throws it clear but deliberately returning the cursor re-grabs it.
+        let snapPoint = snapTarget(mouse: mouse)
+        let withinCapture = hypot(snapPoint.x - ball.center.x, snapPoint.y - ball.center.y) <= config.snapCaptureDistance
+        let doSnap = !ball.isGrabbed && snapHeld && (snapPressed || ball.isSnapped || withinCapture)
+
         if ball.isGrabbed {
+            ball.isSnapped = false                   // an active mouse-drag wins over snap
             ball.follow(target: CGPoint(x: mouse.x + grabOffset.x, y: mouse.y + grabOffset.y),
                         dt: dt, bounds: bounds, config: config)
             sound.setRollSpeed(0)
+        } else if doSnap {
+            if !ball.isSnapped {
+                ball.center = snapPoint              // jump straight under the cursor…
+                ball.velocity = .zero                // …and stop there ("snap & stop")
+                ball.isSnapped = true
+            }
+            // Soft spring holds it under the cursor; breaks away on its own if the
+            // cursor outruns it or gravity drags it past snapBreakDistance.
+            ball.snapStep(target: snapPoint, dt: dt, bounds: bounds, config: config)
+            sound.setRollSpeed(0)
         } else {
+            ball.isSnapped = false                   // key up or broke away → free physics
             let field = KickField.evaluate(ballCenter: ball.center, mouse: mouse,
                                            mouseVelocity: mVel, config: config)
             let events = ball.step(dt: dt, fieldForce: field.force, bounds: bounds, config: config)
@@ -162,6 +210,19 @@ final class FootballPanel: NSPanel {
 
         syncWindowToBall()
         updateInteractivity(mouse: mouse)
+    }
+
+    /// The point the snapped ball is pulled toward, clamped into the play area so
+    /// it stays reachable even at a screen edge.
+    ///
+    /// The target is offset so the spring↔gravity *equilibrium* lands the ball a
+    /// consistent `snapCursorOffset` **below the cursor in every gravity mode**
+    /// (the user asked for "下方" — below). The ball settles `gravityY/snapStiffness`
+    /// off the target, so we pre-subtract that to cancel it out.
+    private func snapTarget(mouse: NSPoint) -> CGPoint {
+        let gravitySag = config.gravityY / config.snapStiffness
+        let raw = CGPoint(x: mouse.x, y: mouse.y - config.snapCursorOffset - gravitySag)
+        return bounds.clampCenter(raw, radius: config.radius)
     }
 
     /// Move the window so the ball graphic lands on `ball.center`, then render.
@@ -184,7 +245,7 @@ final class FootballPanel: NSPanel {
     private func updateInteractivity(mouse: NSPoint) {
         let d = hypot(mouse.x - ball.center.x, mouse.y - ball.center.y)
         let nowInteractive: Bool
-        if ball.isGrabbed {
+        if ball.isGrabbed || ball.isSnapped {
             nowInteractive = true
         } else if interactive {
             nowInteractive = d <= config.radius * 1.5   // exit radius (larger)
@@ -197,9 +258,52 @@ final class FootballPanel: NSPanel {
         }
     }
 
-    private func currentBounds() -> Bounds {
-        let vis = (screen ?? NSScreen.main)?.visibleFrame ?? bounds.rect
-        return Bounds(rect: vis)
+    /// The union of every screen's visible frame — used only while the ball is
+    /// being carried, so it can travel between displays. Offset/odd-sized displays
+    /// leave "void" gaps inside the bounding box the ball can pass through.
+    private func roamingBounds() -> Bounds {
+        let screens = NSScreen.screens
+        guard let first = screens.first else { return bounds }
+        let union = screens.dropFirst().reduce(first.visibleFrame) { $0.union($1.visibleFrame) }
+        return Bounds(rect: union)
+    }
+
+    /// The visible frame of the screen the given point sits on — the play area when
+    /// the ball is free, so each display keeps its own edges. If the point is in a
+    /// gap between displays (or off them all) we fall back to the nearest screen so
+    /// the ball is pulled back onto a real display rather than lost in the void.
+    private func screenBounds(containing point: CGPoint) -> Bounds {
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return bounds }
+        if let onScreen = screens.first(where: { $0.frame.contains(point) }) {
+            return Bounds(rect: onScreen.visibleFrame)
+        }
+        let nearest = screens.min { Self.squaredDistance(from: point, to: $0.frame)
+                                  < Self.squaredDistance(from: point, to: $1.frame) }
+        return Bounds(rect: (nearest ?? screens[0]).visibleFrame)
+    }
+
+    /// Squared distance from a point to the nearest edge/inside of a rect.
+    private static func squaredDistance(from p: CGPoint, to r: CGRect) -> CGFloat {
+        let dx = max(r.minX - p.x, 0, p.x - r.maxX)
+        let dy = max(r.minY - p.y, 0, p.y - r.maxY)
+        return dx * dx + dy * dy
+    }
+
+    /// Whether the **right** Option key is physically down. Uses the permission-free
+    /// CoreGraphics state APIs (no event tap / Input-Monitoring prompt).
+    ///
+    /// `.hidSystemState` is checked first and matters most: this app is a
+    /// non-activating accessory, so it never becomes key and the session-level
+    /// event state can miss the press — but the HID state reads the hardware
+    /// directly regardless of focus. The session keystate and the device-dependent
+    /// right-Option flag bit are kept as belt-and-suspenders fallbacks.
+    private func isRightOptionDown() -> Bool {
+        if CGEventSource.keyState(.hidSystemState, key: rightOptionKeyCode) { return true }
+        if CGEventSource.keyState(.combinedSessionState, key: rightOptionKeyCode) { return true }
+        let rightOptionMask: UInt64 = 0x40   // NX_DEVICERALTKEYMASK
+        if CGEventSource.flagsState(.hidSystemState).rawValue & rightOptionMask != 0 { return true }
+        return false
     }
 
     // MARK: - Mouse

@@ -55,10 +55,15 @@ public enum KickField {
         // Static airflow — always-on gentle drift, quadratic falloff.
         let hoverMag = config.hoverForce * t * t
 
-        // Dynamic kick — only the part of the cursor's motion heading into the
-        // ball contributes (a swipe *away* should not suck the ball along).
-        let approachSpeed = max(0, mouseVelocity.x * ux + mouseVelocity.y * uy)
-        let kickMag = config.kickGain * approachSpeed * t
+        // Dynamic kick. The approach component (cursor moving toward the ball) is
+        // the primary contribution. Lateral speed (cursor sweeping *across* the ball)
+        // also contributes at 35% — so swiping sideways past the ball still kicks it,
+        // matching real-world ball contact without requiring a perfectly aimed thrust.
+        let approach = mouseVelocity.x * ux + mouseVelocity.y * uy
+        let lateral = abs(mouseVelocity.x * (-uy) + mouseVelocity.y * ux)
+        let approachSpeed = max(0, approach)
+        let effectiveKickSpeed = approachSpeed + lateral * 0.35
+        let kickMag = config.kickGain * effectiveKickSpeed * t
 
         let mag = hoverMag + kickMag
         return Result(force: CGPoint(x: ux * mag, y: uy * mag),

@@ -16,6 +16,7 @@ final class FootballLayerView: NSView {
     private let ballContainer = CALayer()
     private let textureLayer = CALayer()
     private let shadowLayer = CALayer()
+    private let chargeRingLayer = CAShapeLayer()  // charge progress arc
 
     private let diameter: CGFloat
     private let ballAnchor: CGPoint
@@ -57,6 +58,24 @@ final class FootballLayerView: NSView {
         textureLayer.frame = ballContainer.bounds
         textureLayer.contentsScale = root.contentsScale
         ballContainer.addSublayer(textureLayer)
+
+        // Charge ring — a progress arc drawn just outside the ball, filled as
+        // the player holds Right Command. Starts from the top (rotation −90°).
+        let cr = diameter * 0.68
+        let chargePath = CGMutablePath()
+        chargePath.addEllipse(in: CGRect(x: ballAnchor.x - cr, y: ballAnchor.y - cr,
+                                         width: cr * 2, height: cr * 2))
+        chargeRingLayer.path = chargePath
+        chargeRingLayer.fillColor = nil
+        chargeRingLayer.lineWidth = 3.5
+        chargeRingLayer.strokeStart = 0
+        chargeRingLayer.strokeEnd = 0
+        chargeRingLayer.lineCap = .round
+        chargeRingLayer.strokeColor = NSColor.systemBlue.cgColor
+        chargeRingLayer.contentsScale = root.contentsScale
+        // Rotate so the fill starts from 12 o'clock.
+        chargeRingLayer.transform = CATransform3DMakeRotation(-.pi / 2, 0, 0, 1)
+        root.addSublayer(chargeRingLayer)
     }
 
     /// Push one physics frame into the layers.
@@ -65,7 +84,8 @@ final class FootballLayerView: NSView {
     ///   - squash: 0…1 vertical compression.
     ///   - liftFactor: 0 (grounded) … 1 (high above the floor).
     ///   - motionState: drives the idle breathing pulse.
-    func render(angle: CGFloat, squash: CGFloat, liftFactor: CGFloat, motionState: MotionState) {
+    func render(angle: CGFloat, squash: CGFloat, liftFactor: CGFloat, motionState: MotionState,
+                chargeFraction: CGFloat = 0) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
 
@@ -97,6 +117,73 @@ final class FootballLayerView: NSView {
         shadowLayer.position = CGPoint(x: ballAnchor.x, y: ballAnchor.y + offset)
         shadowLayer.opacity = Float(0.34 * (1 - 0.7 * liftFactor))
 
+        // Charge ring progress arc — hue sweeps blue → red as charge fills.
+        if chargeFraction > 0.01 {
+            chargeRingLayer.strokeEnd = chargeFraction
+            let hue = CGFloat(0.55) - chargeFraction * 0.55
+            chargeRingLayer.strokeColor = NSColor(hue: hue, saturation: 1.0, brightness: 1.0,
+                                                   alpha: 0.9).cgColor
+        } else {
+            chargeRingLayer.strokeEnd = 0
+        }
+
         CATransaction.commit()
+    }
+
+    /// Brief expand-fade ring at the ball position — fired on each phantom combo strike.
+    func playImpactFlash() {
+        guard let root = layer else { return }
+        let flash = CAShapeLayer()
+        let r = diameter * 0.5
+        flash.path = CGPath(ellipseIn: CGRect(x: ballAnchor.x - r, y: ballAnchor.y - r,
+                                              width: r * 2, height: r * 2), transform: nil)
+        flash.fillColor = NSColor.white.withAlphaComponent(0.55).cgColor
+        flash.strokeColor = nil
+        root.addSublayer(flash)
+
+        let group = CAAnimationGroup()
+        group.duration = 0.22
+        group.fillMode = .forwards
+        group.isRemovedOnCompletion = false
+        let scale = CABasicAnimation(keyPath: "transform")
+        scale.toValue = CATransform3DMakeScale(2.4, 2.4, 1)
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1.0; fade.toValue = 0.0
+        group.animations = [scale, fade]
+        flash.add(group, forKey: "flash")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) { flash.removeFromSuperlayer() }
+    }
+
+    /// Burst ring that expands and fades on charge release; ring multiplier controls size.
+    func playChargeRelease(multiplier: CGFloat) {
+        guard let root = layer else { return }
+        let burst = CAShapeLayer()
+        let r = diameter * 0.55
+        burst.path = CGPath(ellipseIn: CGRect(x: ballAnchor.x - r, y: ballAnchor.y - r,
+                                              width: r * 2, height: r * 2), transform: nil)
+        burst.fillColor = nil
+        burst.strokeColor = NSColor.orange.withAlphaComponent(0.85).cgColor
+        burst.lineWidth = 3
+        root.addSublayer(burst)
+
+        let group = CAAnimationGroup()
+        group.duration = 0.32
+        group.fillMode = .forwards
+        group.isRemovedOnCompletion = false
+        let scale = CABasicAnimation(keyPath: "transform")
+        let s = CGFloat(1 + min(multiplier, 4) * 0.6)
+        scale.toValue = CATransform3DMakeScale(s, s, 1)
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1.0; fade.toValue = 0.0
+        group.animations = [scale, fade]
+        burst.add(group, forKey: "burst")
+
+        // Reset charge ring instantly
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        chargeRingLayer.strokeEnd = 0
+        CATransaction.commit()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.36) { burst.removeFromSuperlayer() }
     }
 }

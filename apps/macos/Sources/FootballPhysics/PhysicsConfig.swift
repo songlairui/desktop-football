@@ -14,6 +14,10 @@ public struct PhysicsConfig: Equatable, Sendable {
     /// The real-world gravity baseline (pt/s², negative because +Y is up). Shared
     /// so `GravityMode.normal` and the default config never drift apart.
     public static let normalGravity: CGFloat = -2000
+    /// Kick-field radius in normal mode — doubled in game mode.
+    public static let normalKickRadius: CGFloat = 95
+    /// Kick gain in normal mode — boosted in game mode.
+    public static let normalKickGain: CGFloat = 130
 
     // MARK: Geometry
 
@@ -121,8 +125,8 @@ public struct PhysicsConfig: Equatable, Sendable {
         bounceCutoff: CGFloat = 90,
         sleepSpeed: CGFloat = 14,
         maxSpeed: CGFloat = 6000,
-        kickRadius: CGFloat = 95,
-        kickGain: CGFloat = 130,
+        kickRadius: CGFloat = PhysicsConfig.normalKickRadius,
+        kickGain: CGFloat = PhysicsConfig.normalKickGain,
         hoverForce: CGFloat = 220,
         clickImpulse: CGFloat = 950,
         swipeSoundThreshold: CGFloat = 600,
@@ -160,4 +164,10 @@ public struct PhysicsConfig: Equatable, Sendable {
 
     /// The canonical desktop-football tuning.
     public static let standard = PhysicsConfig()
+
+    /// A copy with `kickGain` set to `gain` — used to suppress dynamic kicks
+    /// during charge hold while keeping the hover-force field active.
+    public func withKickGain(_ gain: CGFloat) -> PhysicsConfig {
+        var c = self; c.kickGain = gain; return c
+    }
 }

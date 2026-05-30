@@ -250,6 +250,7 @@ final class MetalScene {
         let pointsToWorld = tankHeight / max(Float(bounds.rect.height), 1)
         let halfWidth = Float(bounds.rect.width) * pointsToWorld * 0.5
         return TankMapping(pointsToWorld: pointsToWorld,
+                           height: tankHeight,
                            minX: -halfWidth,
                            maxX: halfWidth,
                            minZ: -360,
@@ -271,37 +272,76 @@ final class MetalScene {
                                 radius: Float,
                                 mapping: TankMapping) {
         var vertices: [GuideVertex] = []
-        let y: Float = 0.75
+        let floorY: Float = 0.75
         let step: Float = 80
-        let minor = SIMD4<Float>(0.45, 0.75, 1.0, 0.18)
-        let majorX = SIMD4<Float>(0.70, 0.90, 1.0, 0.34)
-        let majorZ = SIMD4<Float>(0.70, 1.0, 0.78, 0.30)
-        let drop = SIMD4<Float>(1.0, 1.0, 1.0, 0.46)
+        let floorMinor = SIMD4<Float>(0.45, 0.75, 1.0, 0.055)
+        let floorMajor = SIMD4<Float>(0.70, 0.92, 1.0, 0.12)
+        let wallMinor = SIMD4<Float>(0.58, 0.82, 1.0, 0.035)
+        let wallMajor = SIMD4<Float>(0.78, 0.94, 1.0, 0.075)
+        let edge = SIMD4<Float>(0.88, 0.97, 1.0, 0.14)
+        let drop = SIMD4<Float>(1.0, 1.0, 1.0, 0.26)
 
         func addLine(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ color: SIMD4<Float>) {
             vertices.append(GuideVertex(position: a, color: color))
             vertices.append(GuideVertex(position: b, color: color))
         }
 
+        // Fixed floor grid.
         var x = floor(mapping.minX / step) * step
         while x <= mapping.maxX + 0.1 {
-            let color = abs(x) < step * 0.5 ? majorZ : minor
-            addLine(SIMD3<Float>(x, y, mapping.minZ),
-                    SIMD3<Float>(x, y, mapping.maxZ),
+            let color = abs(x) < step * 0.5 ? floorMajor : floorMinor
+            addLine(SIMD3<Float>(x, floorY, mapping.minZ),
+                    SIMD3<Float>(x, floorY, mapping.maxZ),
                     color)
             x += step
         }
 
         var z = floor(mapping.minZ / step) * step
         while z <= mapping.maxZ + 0.1 {
-            let color = abs(z) < step * 0.5 ? majorX : minor
-            addLine(SIMD3<Float>(mapping.minX, y, z),
-                    SIMD3<Float>(mapping.maxX, y, z),
+            let color = abs(z) < step * 0.5 ? floorMajor : floorMinor
+            addLine(SIMD3<Float>(mapping.minX, floorY, z),
+                    SIMD3<Float>(mapping.maxX, floorY, z),
                     color)
             z += step
         }
 
-        addLine(SIMD3<Float>(center.x, y, center.z),
+        // Fixed back wall grid so the viewer has a stable depth reference.
+        x = floor(mapping.minX / step) * step
+        while x <= mapping.maxX + 0.1 {
+            let color = abs(x) < step * 0.5 ? wallMajor : wallMinor
+            addLine(SIMD3<Float>(x, floorY, mapping.maxZ),
+                    SIMD3<Float>(x, mapping.height, mapping.maxZ),
+                    color)
+            x += step
+        }
+
+        var y = floor(floorY / step) * step
+        while y <= mapping.height + 0.1 {
+            let color = abs(y) < step * 0.5 ? wallMajor : wallMinor
+            addLine(SIMD3<Float>(mapping.minX, y, mapping.maxZ),
+                    SIMD3<Float>(mapping.maxX, y, mapping.maxZ),
+                    color)
+            y += step
+        }
+
+        // Tank boundary edges: subtle enough not to become UI chrome, but fixed.
+        addLine(SIMD3<Float>(mapping.minX, floorY, mapping.minZ),
+                SIMD3<Float>(mapping.maxX, floorY, mapping.minZ), edge)
+        addLine(SIMD3<Float>(mapping.minX, floorY, mapping.maxZ),
+                SIMD3<Float>(mapping.maxX, floorY, mapping.maxZ), edge)
+        addLine(SIMD3<Float>(mapping.minX, floorY, mapping.minZ),
+                SIMD3<Float>(mapping.minX, floorY, mapping.maxZ), edge)
+        addLine(SIMD3<Float>(mapping.maxX, floorY, mapping.minZ),
+                SIMD3<Float>(mapping.maxX, floorY, mapping.maxZ), edge)
+        addLine(SIMD3<Float>(mapping.minX, floorY, mapping.maxZ),
+                SIMD3<Float>(mapping.minX, mapping.height, mapping.maxZ), edge)
+        addLine(SIMD3<Float>(mapping.maxX, floorY, mapping.maxZ),
+                SIMD3<Float>(mapping.maxX, mapping.height, mapping.maxZ), edge)
+        addLine(SIMD3<Float>(mapping.minX, mapping.height, mapping.maxZ),
+                SIMD3<Float>(mapping.maxX, mapping.height, mapping.maxZ), edge)
+
+        // Ball height reference in the fixed tank, not a moving coordinate axis.
+        addLine(SIMD3<Float>(center.x, floorY, center.z),
                 SIMD3<Float>(center.x, center.y, center.z),
                 drop)
 
@@ -319,7 +359,7 @@ final class MetalScene {
     // MARK: - Procedural texture
 
     private static func makeFootballTexture(device: MTLDevice) -> MTLTexture {
-        let size = 512
+        let size = 1024
         // Draw the football pattern into a CGContext, then upload to Metal.
         let bytesPerPixel = 4
         let bytesPerRow = size * bytesPerPixel
@@ -332,39 +372,29 @@ final class MetalScene {
         else { return Self.fallbackTexture(device: device) }
 
         let s = CGFloat(size)
-        let center = CGPoint(x: s / 2, y: s / 2)
-        let r = s / 2 - s * 0.03
+        ctx.setAllowsAntialiasing(true)
+        ctx.setShouldAntialias(true)
 
-        // White base. Do not clip to a circle: UV sphere sampling needs an
+        // Matte white base. Do not clip to a circle: UV sphere sampling needs an
         // opaque full-rectangle texture, otherwise transparent corners wrap onto
         // the ball as broken dark patches.
-        ctx.setFillColor(CGColor(red: 0.98, green: 0.98, blue: 0.98, alpha: 1))
+        ctx.setFillColor(CGColor(red: 0.965, green: 0.955, blue: 0.925, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: s, height: s))
 
-        // Black pentagons
-        ctx.setFillColor(CGColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1))
-        Self.fillPentagon(ctx, center: center, radius: r * 0.34, angle: .pi / 2)
-        let ringDist = r * 0.80
-        let ringR = r * 0.30
-        for k in 0..<5 {
-            let theta = CGFloat.pi / 2 + CGFloat(k) * (2 * .pi / 5)
-            let pc = CGPoint(x: center.x + cos(theta) * ringDist,
-                             y: center.y + sin(theta) * ringDist)
-            Self.fillPentagon(ctx, center: pc, radius: ringR, angle: theta + .pi)
-        }
+        Self.drawBaseGrain(ctx, size: s)
+        Self.drawPanelSeams(ctx, size: s)
 
-        // Seams
-        ctx.setStrokeColor(CGColor(red: 0.22, green: 0.22, blue: 0.22, alpha: 0.6))
-        ctx.setLineWidth(s * 0.012)
-        ctx.setLineCap(.round)
-        for k in 0..<5 {
-            let theta = CGFloat.pi / 2 + (CGFloat(k) + 0.5) * (2 * .pi / 5)
-            ctx.move(to: CGPoint(x: center.x + cos(theta) * r * 0.18,
-                                 y: center.y + sin(theta) * r * 0.18))
-            ctx.addLine(to: CGPoint(x: center.x + cos(theta) * r * 0.62,
-                                    y: center.y + sin(theta) * r * 0.62))
+        let centers = [
+            CGPoint(x: s * 0.12, y: s * 0.50),
+            CGPoint(x: s * 0.37, y: s * 0.48),
+            CGPoint(x: s * 0.62, y: s * 0.52),
+            CGPoint(x: s * 0.87, y: s * 0.50),
+        ]
+        for (index, center) in centers.enumerated() {
+            let rotation = CGFloat(index) * .pi * 0.42 + (index.isMultiple(of: 2) ? 0.0 : .pi)
+            Self.drawTriondaCluster(ctx, center: center, scale: s * 0.235, rotation: rotation)
         }
-        ctx.strokePath()
+        Self.drawSubtleEmboss(ctx, size: s)
 
         // Upload to MTLTexture
         let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
@@ -383,6 +413,268 @@ final class MetalScene {
                                        size: MTLSize(width: size, height: size, depth: 1)),
                     mipmapLevel: 0, withBytes: data, bytesPerRow: bytesPerRow)
         return tex
+    }
+
+    private static func drawBaseGrain(_ ctx: CGContext, size s: CGFloat) {
+        ctx.saveGState()
+        ctx.setLineWidth(s * 0.0012)
+        for i in stride(from: 0, through: Int(s), by: 18) {
+            let y = CGFloat(i)
+            let alpha = 0.025 + 0.018 * abs(sin(CGFloat(i) * 0.19))
+            ctx.setStrokeColor(CGColor(red: 0.18, green: 0.18, blue: 0.16, alpha: alpha))
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: 0, y: y))
+            path.addCurve(to: CGPoint(x: s, y: y + sin(y * 0.03) * s * 0.006),
+                          control1: CGPoint(x: s * 0.30, y: y + s * 0.010),
+                          control2: CGPoint(x: s * 0.70, y: y - s * 0.010))
+            ctx.addPath(path)
+            ctx.strokePath()
+        }
+        ctx.restoreGState()
+    }
+
+    private static func drawPanelSeams(_ ctx: CGContext, size s: CGFloat) {
+        func strokeSeam(_ path: CGPath) {
+            ctx.saveGState()
+            ctx.setLineCap(.round)
+            ctx.setStrokeColor(CGColor(red: 0.54, green: 0.50, blue: 0.43, alpha: 0.30))
+            ctx.setLineWidth(s * 0.026)
+            ctx.addPath(path)
+            ctx.strokePath()
+            ctx.setStrokeColor(CGColor(red: 1, green: 1, blue: 0.96, alpha: 0.86))
+            ctx.setLineWidth(s * 0.014)
+            ctx.addPath(path)
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
+
+        for x0 in stride(from: -s * 0.18, through: s * 1.12, by: s * 0.25) {
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: x0, y: -s * 0.08))
+            path.addCurve(to: CGPoint(x: x0 + s * 0.17, y: s * 1.08),
+                          control1: CGPoint(x: x0 + s * 0.11, y: s * 0.23),
+                          control2: CGPoint(x: x0 - s * 0.08, y: s * 0.78))
+            strokeSeam(path)
+        }
+
+        for y0 in [s * 0.23, s * 0.77] {
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: -s * 0.05, y: y0))
+            path.addCurve(to: CGPoint(x: s * 1.05, y: y0 + s * 0.03),
+                          control1: CGPoint(x: s * 0.27, y: y0 + s * 0.09),
+                          control2: CGPoint(x: s * 0.76, y: y0 - s * 0.08))
+            strokeSeam(path)
+        }
+    }
+
+    private static func drawTriondaCluster(_ ctx: CGContext,
+                                           center: CGPoint,
+                                           scale: CGFloat,
+                                           rotation: CGFloat) {
+        let red = CGColor(red: 0.84, green: 0.04, blue: 0.06, alpha: 1)
+        let green = CGColor(red: 0.04, green: 0.54, blue: 0.18, alpha: 1)
+        let blue = CGColor(red: 0.03, green: 0.42, blue: 0.86, alpha: 1)
+
+        Self.drawTriondaArm(ctx, center: center, scale: scale,
+                            rotation: rotation,
+                            color: red, icon: .maple)
+        Self.drawTriondaArm(ctx, center: center, scale: scale,
+                            rotation: rotation + .pi * 2 / 3,
+                            color: green, icon: .eagle)
+        Self.drawTriondaArm(ctx, center: center, scale: scale,
+                            rotation: rotation + .pi * 4 / 3,
+                            color: blue, icon: .star)
+
+        ctx.saveGState()
+        ctx.translateBy(x: center.x, y: center.y)
+        ctx.rotate(by: rotation + .pi / 6)
+        ctx.scaleBy(x: scale, y: scale)
+        let tri = CGMutablePath()
+        for i in 0..<3 {
+            let a = CGFloat(i) * .pi * 2 / 3 - .pi / 2
+            let p = CGPoint(x: cos(a) * 0.20, y: sin(a) * 0.20)
+            if i == 0 { tri.move(to: p) } else { tri.addLine(to: p) }
+        }
+        tri.closeSubpath()
+        ctx.setFillColor(CGColor(red: 0.98, green: 0.96, blue: 0.88, alpha: 0.94))
+        ctx.addPath(tri)
+        ctx.fillPath()
+        ctx.setStrokeColor(CGColor(red: 0.93, green: 0.72, blue: 0.30, alpha: 0.80))
+        ctx.setLineWidth(0.025)
+        ctx.addPath(tri)
+        ctx.strokePath()
+        ctx.restoreGState()
+    }
+
+    private enum TriondaIcon {
+        case star
+        case maple
+        case eagle
+    }
+
+    private static func drawTriondaArm(_ ctx: CGContext,
+                                       center: CGPoint,
+                                       scale: CGFloat,
+                                       rotation: CGFloat,
+                                       color: CGColor,
+                                       icon: TriondaIcon) {
+        ctx.saveGState()
+        ctx.translateBy(x: center.x, y: center.y)
+        ctx.rotate(by: rotation)
+        ctx.scaleBy(x: scale, y: scale)
+
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: 0.05, y: -0.16))
+        path.addCurve(to: CGPoint(x: 0.95, y: -0.30),
+                      control1: CGPoint(x: 0.28, y: -0.35),
+                      control2: CGPoint(x: 0.68, y: -0.36))
+        path.addCurve(to: CGPoint(x: 1.15, y: 0.17),
+                      control1: CGPoint(x: 1.10, y: -0.20),
+                      control2: CGPoint(x: 1.18, y: 0.01))
+        path.addCurve(to: CGPoint(x: 0.17, y: 0.24),
+                      control1: CGPoint(x: 0.80, y: 0.36),
+                      control2: CGPoint(x: 0.45, y: 0.33))
+        path.addCurve(to: CGPoint(x: 0.05, y: -0.16),
+                      control1: CGPoint(x: 0.07, y: 0.12),
+                      control2: CGPoint(x: 0.01, y: -0.04))
+        path.closeSubpath()
+
+        ctx.saveGState()
+        ctx.addPath(path)
+        ctx.clip()
+        ctx.setFillColor(color)
+        ctx.fill(CGRect(x: -0.10, y: -0.48, width: 1.38, height: 0.96))
+
+        ctx.setLineCap(.round)
+        for i in -4...4 {
+            let y = CGFloat(i) * 0.095
+            let line = CGMutablePath()
+            line.move(to: CGPoint(x: 0.04, y: y - 0.08))
+            line.addCurve(to: CGPoint(x: 1.18, y: y + 0.04),
+                          control1: CGPoint(x: 0.36, y: y + 0.12),
+                          control2: CGPoint(x: 0.82, y: y - 0.13))
+            ctx.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.18))
+            ctx.setLineWidth(0.016)
+            ctx.addPath(line)
+            ctx.strokePath()
+        }
+
+        for i in 0..<3 {
+            let x = 0.34 + CGFloat(i) * 0.13
+            let mark = CGMutablePath()
+            mark.move(to: CGPoint(x: x, y: -0.26))
+            mark.addLine(to: CGPoint(x: x + 0.10, y: 0.22))
+            ctx.setStrokeColor(CGColor(red: 0.02, green: 0.02, blue: 0.02, alpha: 0.20))
+            ctx.setLineWidth(0.028)
+            ctx.addPath(mark)
+            ctx.strokePath()
+        }
+        ctx.restoreGState()
+
+        ctx.setStrokeColor(CGColor(red: 0.95, green: 0.75, blue: 0.33, alpha: 0.92))
+        ctx.setLineWidth(0.026)
+        ctx.addPath(path)
+        ctx.strokePath()
+
+        ctx.setStrokeColor(CGColor(red: 0.98, green: 0.96, blue: 0.90, alpha: 0.86))
+        ctx.setLineWidth(0.018)
+        ctx.addPath(path)
+        ctx.strokePath()
+
+        switch icon {
+        case .star:
+            drawStar(ctx, center: CGPoint(x: 0.78, y: -0.01), radius: 0.15)
+        case .maple:
+            drawMapleLeaf(ctx, center: CGPoint(x: 0.77, y: -0.01), radius: 0.17)
+        case .eagle:
+            drawEagleGlyph(ctx, center: CGPoint(x: 0.77, y: -0.01), radius: 0.17)
+        }
+
+        ctx.restoreGState()
+    }
+
+    private static func drawSubtleEmboss(_ ctx: CGContext, size s: CGFloat) {
+        ctx.saveGState()
+        ctx.setStrokeColor(CGColor(red: 0.72, green: 0.68, blue: 0.58, alpha: 0.18))
+        ctx.setLineWidth(s * 0.003)
+        for x in stride(from: s * 0.04, through: s * 0.96, by: s * 0.115) {
+            for y in stride(from: s * 0.08, through: s * 0.92, by: s * 0.18) {
+                let path = CGMutablePath()
+                path.addEllipse(in: CGRect(x: x - s * 0.015, y: y - s * 0.015,
+                                           width: s * 0.03, height: s * 0.03))
+                ctx.addPath(path)
+                ctx.strokePath()
+            }
+        }
+        ctx.restoreGState()
+    }
+
+    private static func drawStar(_ ctx: CGContext, center: CGPoint, radius: CGFloat) {
+        let path = CGMutablePath()
+        for i in 0..<10 {
+            let r = i.isMultiple(of: 2) ? radius : radius * 0.42
+            let a = -CGFloat.pi / 2 + CGFloat(i) * .pi / 5
+            let p = CGPoint(x: center.x + cos(a) * r, y: center.y + sin(a) * r)
+            if i == 0 { path.move(to: p) } else { path.addLine(to: p) }
+        }
+        path.closeSubpath()
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.86))
+        ctx.addPath(path)
+        ctx.fillPath()
+    }
+
+    private static func drawMapleLeaf(_ ctx: CGContext, center: CGPoint, radius: CGFloat) {
+        let points: [CGPoint] = [
+            CGPoint(x: 0.00, y: 1.00), CGPoint(x: 0.14, y: 0.42),
+            CGPoint(x: 0.45, y: 0.62), CGPoint(x: 0.34, y: 0.25),
+            CGPoint(x: 0.72, y: 0.18), CGPoint(x: 0.34, y: -0.02),
+            CGPoint(x: 0.52, y: -0.44), CGPoint(x: 0.12, y: -0.22),
+            CGPoint(x: 0.05, y: -0.78), CGPoint(x: -0.05, y: -0.78),
+            CGPoint(x: -0.12, y: -0.22), CGPoint(x: -0.52, y: -0.44),
+            CGPoint(x: -0.34, y: -0.02), CGPoint(x: -0.72, y: 0.18),
+            CGPoint(x: -0.34, y: 0.25), CGPoint(x: -0.45, y: 0.62),
+            CGPoint(x: -0.14, y: 0.42),
+        ]
+        let path = CGMutablePath()
+        for (index, p) in points.enumerated() {
+            let point = CGPoint(x: center.x + p.x * radius, y: center.y + p.y * radius)
+            if index == 0 { path.move(to: point) } else { path.addLine(to: point) }
+        }
+        path.closeSubpath()
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.84))
+        ctx.addPath(path)
+        ctx.fillPath()
+    }
+
+    private static func drawEagleGlyph(_ ctx: CGContext, center: CGPoint, radius: CGFloat) {
+        ctx.saveGState()
+        ctx.translateBy(x: center.x, y: center.y)
+        ctx.scaleBy(x: radius, y: radius)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        ctx.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.84))
+        ctx.setLineWidth(0.16)
+
+        let wing = CGMutablePath()
+        wing.move(to: CGPoint(x: -0.85, y: 0.18))
+        wing.addCurve(to: CGPoint(x: 0.02, y: 0.38),
+                      control1: CGPoint(x: -0.46, y: 0.62),
+                      control2: CGPoint(x: -0.16, y: 0.58))
+        wing.addCurve(to: CGPoint(x: 0.82, y: 0.02),
+                      control1: CGPoint(x: 0.24, y: 0.18),
+                      control2: CGPoint(x: 0.50, y: 0.03))
+        ctx.addPath(wing)
+        ctx.strokePath()
+
+        for i in 0..<3 {
+            let y = 0.03 - CGFloat(i) * 0.25
+            let feather = CGMutablePath()
+            feather.move(to: CGPoint(x: -0.55 + CGFloat(i) * 0.18, y: y))
+            feather.addLine(to: CGPoint(x: 0.54 - CGFloat(i) * 0.10, y: y - 0.18))
+            ctx.addPath(feather)
+            ctx.strokePath()
+        }
+        ctx.restoreGState()
     }
 
     private static func fallbackTexture(device: MTLDevice) -> MTLTexture {
@@ -477,11 +769,11 @@ final class MetalScene {
         float3 V = normalize(u.viewPos - in.worldPos);
         float3 L = normalize(u.lightPos - in.worldPos);
         float3 H = normalize(L + V);
-        float ambient = 0.15;
+        float ambient = 0.18;
         float diff = max(dot(N, L), 0.0);
         float diffuse = 0.20 + 0.75 * diff;
         float spec = pow(max(dot(N, H), 0.0), 64.0);
-        float specular = 0.40 * spec;
+        float specular = 0.24 * spec;
         float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
         float rim = 0.25 * fresnel;
         float lighting = ambient + diffuse + specular + rim;
@@ -572,6 +864,7 @@ private struct GuideVertex {
 
 private struct TankMapping {
     var pointsToWorld: Float
+    var height: Float
     var minX: Float
     var maxX: Float
     var minZ: Float

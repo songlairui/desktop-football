@@ -33,6 +33,7 @@ final class FootballPanel: NSPanel {
     private var lastStepTime: CFTimeInterval = 0
     private var prevMouse = NSEvent.mouseLocation
     private var lastKickAt: CFTimeInterval = 0
+    private var wasInGlassStrikeDisk = false
 
     // MARK: Interaction state
     private var didDrag = false
@@ -99,7 +100,7 @@ final class FootballPanel: NSPanel {
         ballView.autoresizingMask = [.width, .height]
         contentView = ballView
 
-        syncWindowToBall()
+        syncWindowToBall(mouse: mouse)
         sound.start()
     }
 
@@ -115,6 +116,7 @@ final class FootballPanel: NSPanel {
     func reset() {
         bounds = screenBounds(containing: ball.center)
         ball = BallState.resting(atX: bounds.rect.midX, bounds: bounds, config: config)
+        wasInGlassStrikeDisk = false
         syncWindowToBall()
     }
 
@@ -190,6 +192,7 @@ final class FootballPanel: NSPanel {
         interactive = false
         super.orderFrontRegardless()
         prevMouse = NSEvent.mouseLocation
+        wasInGlassStrikeDisk = false
         startLoop()
     }
 
@@ -240,8 +243,10 @@ final class FootballPanel: NSPanel {
 
     private func tick(dt: CGFloat, now: CFTimeInterval) {
         let mouse = NSEvent.mouseLocation
-        let mVel = CGPoint(x: (mouse.x - prevMouse.x) / dt, y: (mouse.y - prevMouse.y) / dt)
+        let previousMouse = prevMouse
+        let mVel = CGPoint(x: (mouse.x - previousMouse.x) / dt, y: (mouse.y - previousMouse.y) / dt)
         prevMouse = mouse
+        var didGlassStrike = false
 
         // ── Snap (Right Option) ──────────────────────────────────────────────────
         let snapHeld = isRightOptionDown()
@@ -282,20 +287,29 @@ final class FootballPanel: NSPanel {
         } else {
             ball.isSnapped = false
             // During charge: suppress the dynamic kick so the player can aim without
-            // accidentally poking the ball; hover force still applies.
-            let evalConfig = chargeHeld ? config.withKickGain(0) : config
-            let field = KickField.evaluate(ballCenter: ball.center, mouse: mouse,
-                                           mouseVelocity: mVel, config: evalConfig)
-            let events = ball.step(dt: dt, fieldForce: field.force, bounds: bounds, config: config)
+            // accidentally poking the ball. Outside charge, a kick is an explicit
+            // sweep through the projected contact disk on the front glass plane.
+            if !chargeHeld {
+                let strike = GlassContact.evaluate(
+                    ballCenter: ball.center,
+                    previousMouse: previousMouse,
+                    mouse: mouse,
+                    mouseVelocity: mVel,
+                    strikeRadius: glassStrikeRadius,
+                    minimumSpeed: config.swipeSoundThreshold,
+                    wasInside: wasInGlassStrikeDisk,
+                    cooldownReady: now - lastKickAt > 0.11
+                )
+                if strike.didStrike {
+                    applyGlassStrike(strike, now: now)
+                    didGlassStrike = true
+                }
+            }
+
+            let events = ball.step(dt: dt, fieldForce: .zero, bounds: bounds, config: config)
 
             if let impact = events.landed { sound.playBounce(impact: impact) }
             if let impact = events.hitWall { sound.playBounce(impact: impact * 0.6) }
-
-            if !chargeHeld && field.approachSpeed > config.swipeSoundThreshold,
-               now - lastKickAt > 0.12 {
-                sound.playKick(strength: field.approachSpeed)
-                lastKickAt = now
-            }
 
             let state = ball.motionState(config: config, bounds: bounds)
             sound.setRollSpeed(state == .rolling ? abs(ball.velocity.x) : 0)
@@ -310,8 +324,9 @@ final class FootballPanel: NSPanel {
             ring.update(mouse: mouse, inRange: d < config.kickRadius, chargeFraction: chargeFraction)
         }
 
-        syncWindowToBall()
         updateInteractivity(mouse: mouse)
+        wasInGlassStrikeDisk = distanceFromBall(mouse) <= glassStrikeRadius
+        syncWindowToBall(mouse: mouse, didStrike: didGlassStrike)
     }
 
     /// Zone-entry combo and zigzag mega-combo detection. Call each free-physics frame.
@@ -372,9 +387,13 @@ final class FootballPanel: NSPanel {
 
     /// Push the current ball state to the Metal scene. The window no longer moves —
     /// the 3D camera and projection handle positioning.
-    private func syncWindowToBall() {
+    private func syncWindowToBall(mouse: NSPoint = NSEvent.mouseLocation,
+                                  didStrike: Bool = false) {
         syncOverlayFrameToBall()
-        ballView.render(ballState: ball, config: config, bounds: bounds)
+        ballView.render(ballState: ball,
+                        config: config,
+                        bounds: bounds,
+                        interaction: interactionFeedback(mouse: mouse, didStrike: didStrike))
     }
 
     private func syncOverlayFrameToBall() {
@@ -401,12 +420,73 @@ final class FootballPanel: NSPanel {
         if ball.isGrabbed || ball.isSnapped {
             nowInteractive = true
         } else if interactive {
-            nowInteractive = d <= config.radius * 1.5   // exit radius (larger)
+            nowInteractive = d <= glassGrabExitRadius
         } else {
-            nowInteractive = d <= config.radius * 1.15  // enter radius (smaller)
+            nowInteractive = d <= glassGrabRadius
         }
         interactive = nowInteractive
         ignoresMouseEvents = !nowInteractive
+        if nowInteractive {
+            (ball.isGrabbed ? NSCursor.closedHand : NSCursor.openHand).set()
+        }
+    }
+
+    private var glassGrabRadius: CGFloat {
+        config.radius * 1.30
+    }
+
+    private var glassGrabExitRadius: CGFloat {
+        config.radius * 1.70
+    }
+
+    private var glassStrikeRadius: CGFloat {
+        isGameMode ? config.kickRadius : max(config.radius * 2.2, config.radius + 34)
+    }
+
+    private var glassRevealRadius: CGFloat {
+        glassStrikeRadius * 1.65
+    }
+
+    private func interactionFeedback(mouse: NSPoint,
+                                     didStrike: Bool) -> GlassInteractionFeedback {
+        let d = distanceFromBall(mouse)
+        return GlassInteractionFeedback(
+            ballCenter: ball.center,
+            mouse: mouse,
+            visibleRadius: glassGrabRadius,
+            strikeRadius: glassStrikeRadius,
+            isNear: d <= glassRevealRadius,
+            canGrab: d <= glassGrabRadius,
+            isGrabbed: ball.isGrabbed,
+            isSnapped: ball.isSnapped,
+            didStrike: didStrike
+        )
+    }
+
+    private func applyGlassStrike(_ strike: GlassContact.Result, now: CFTimeInterval) {
+        ball.velocity.x += strike.impulse.x
+        ball.velocity.y += strike.impulse.y
+        if ball.isGrounded(config: config, bounds: bounds),
+           abs(strike.impulse.y) < abs(strike.impulse.x) * 0.35 {
+            ball.velocity.y += 160 + 180 * strike.strength
+        }
+        capBallSpeed(to: config.maxSpeed * 1.08)
+        ball.squash = min(config.maxSquash, ball.squash + 0.12 + 0.18 * strike.strength)
+
+        let angle = atan2(strike.impulse.y, strike.impulse.x)
+        let power = 0.35 + strike.strength * 0.65
+        EffectsOverlayPanel.shared.showStrikeEffect(at: ball.center, power: power)
+        EffectsOverlayPanel.shared.showSlashEffect(at: ball.center, angle: angle, power: power)
+        sound.playKick(strength: hypot(strike.impulse.x, strike.impulse.y))
+        lastKickAt = now
+    }
+
+    private func capBallSpeed(to maxSpeed: CGFloat) {
+        let speed = hypot(ball.velocity.x, ball.velocity.y)
+        guard speed > maxSpeed, speed > 0 else { return }
+        let k = maxSpeed / speed
+        ball.velocity.x *= k
+        ball.velocity.y *= k
     }
 
     /// The union of every screen's visible frame — used only while the ball is
@@ -545,13 +625,15 @@ final class FootballPanel: NSPanel {
 
     override func mouseDown(with event: NSEvent) {
         let m = NSEvent.mouseLocation
-        guard ball.isGrabbed || ball.isSnapped || distanceFromBall(m) <= config.radius * 1.5 else {
+        guard ball.isGrabbed || ball.isSnapped || distanceFromBall(m) <= glassGrabRadius else {
             interactive = false
             ignoresMouseEvents = true
             return
         }
         didDrag = false
         ball.velocity = .zero                       // "catch" the ball
+        ball.isGrabbed = true
+        ball.isSnapped = false
         grabOffset = CGPoint(x: ball.center.x - m.x, y: ball.center.y - m.y)
     }
 
@@ -560,15 +642,13 @@ final class FootballPanel: NSPanel {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        if !didDrag {
-            didDrag = true
-            ball.isGrabbed = true                    // hand off to follow() in tick
-        }
+        didDrag = true
     }
 
     override func mouseUp(with event: NSEvent) {
+        ball.isGrabbed = false
         if didDrag {
-            ball.isGrabbed = false                   // release → tick throws with carried velocity
+            // release → tick throws with carried velocity
         } else {
             ball.applyClick(config: config)          // tap → dribble pop
             sound.playKick(strength: 420)

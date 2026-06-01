@@ -292,8 +292,8 @@ final class MetalScene {
         uniforms.projection = camera.projectionMatrix(aspect: aspect, frontHeight: mapping.height)
         uniforms.view = camera.viewMatrix(frontHeight: mapping.height)
 
-        let worldBall = screenToTankWorld(ballState.center,
-                                          mapping: mapping)
+        let worldBall = renderEffects.overrideWorldPosition
+            ?? screenToTankWorld(ballState.center, mapping: mapping)
         uniforms.model = float4x4(translation: worldBall)
             * float4x4(rotationY: Float(renderEffects.rotationY))
             * float4x4(rotationX: Float(renderEffects.rotationX))
@@ -309,6 +309,12 @@ final class MetalScene {
         // 3D relation is readable without tinting the whole screen.
         if showsGuideLines {
             drawGuideLines(encoder: encoder, center: worldBall, radius: visualRadius, mapping: mapping)
+        }
+
+        // Optional rope for the Hanging Charm mode. Drawn before the ball so
+        // the ball's depth occludes the rope endpoint.
+        if let ropeAnchor = renderEffects.ropeAnchor {
+            drawRope(encoder: encoder, from: ropeAnchor, to: worldBall)
         }
 
         // ── Shadow disc ───────────────────────────────────────────────────────
@@ -478,6 +484,36 @@ final class MetalScene {
         }
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<SceneUniforms>.stride, index: 1)
         encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: vertices.count)
+    }
+
+    /// Draws a thin semi-transparent line from `from` to `to` in world space.
+    /// Reuses `guidePipeline` and its `GuideVertex` layout. Drawn with the
+    /// depth state set read-only so the rope never occludes the ball itself.
+    private func drawRope(encoder: MTLRenderCommandEncoder,
+                          from: SIMD3<Float>,
+                          to: SIMD3<Float>) {
+        // Two segments of slightly different colour: a brighter "core" and a
+        // fainter "halo" beneath, so the rope reads against both light and
+        // dark backgrounds without picking a fixed colour.
+        let core = SIMD4<Float>(0.82, 0.86, 0.92, 0.55)
+        let halo = SIMD4<Float>(0.65, 0.72, 0.85, 0.22)
+        let vertices: [GuideVertex] = [
+            GuideVertex(position: from, color: halo),
+            GuideVertex(position: to,   color: halo),
+            GuideVertex(position: from, color: core),
+            GuideVertex(position: to,   color: core),
+        ]
+        encoder.setRenderPipelineState(guidePipeline)
+        encoder.setDepthStencilState(makeDepthState(device, readOnly: true))
+        vertices.withUnsafeBytes { bytes in
+            if let base = bytes.baseAddress {
+                encoder.setVertexBytes(base, length: bytes.count, index: 0)
+            }
+        }
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<SceneUniforms>.stride, index: 1)
+        // Halo first, then core on top.
+        encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: 2)
+        encoder.drawPrimitives(type: .line, vertexStart: 2, vertexCount: 2)
     }
 
     // MARK: - Mesh layout
@@ -1300,8 +1336,14 @@ final class MetalScene {
         float roughness = clamp(roughnessTexture.sample(texSampler, in.uv).r, 0.35, 0.75);
 
         float3 V = normalize(u.viewPos - in.worldPos);
-        float3 shadeN = macroN;
-        float3 specN = normalize(mix(macroN, detailN, 0.35));
+        float macroFacing = max(dot(macroN, V), 0.0);
+        // Bump is dialled out toward the silhouette so the normal map can't
+        // create a halo / muddy edge where macroN is nearly perpendicular to
+        // V.  Center of the ball gets full relief, edge stays smooth.
+        float bumpWeight = smoothstep(0.0, 0.35, macroFacing) * 0.55;
+        float3 bumpN = normalize(mix(macroN, detailN, bumpWeight));
+        float3 shadeN = bumpN;
+        float3 specN = bumpN;
         float3 keyDir = normalize(u.lightPos - in.worldPos);
         float3 fillDir = normalize(float3(0.55, 0.42, 0.75));
         float3 rimDir = normalize(float3(0.45, 0.25, -0.85));
@@ -1309,7 +1351,10 @@ final class MetalScene {
 
         float key = max(dot(shadeN, keyDir), 0.0);
         float fill = max(dot(shadeN, fillDir), 0.0);
-        float rimLight = max(dot(shadeN, rimDir), 0.0);
+        // rim / fresnel / hemi stay on macroN so the ball's overall light
+        // envelope (silhouette glow, hemisphere ambient) reads as a clean
+        // sphere instead of being chopped up by the bump.
+        float rimLight = max(dot(macroN, rimDir), 0.0);
         float wrapKey = key * 0.70 + 0.30;
 
         float3 keyTint = float3(1.0, 0.91, 0.72);
@@ -1317,13 +1362,16 @@ final class MetalScene {
         float3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(H, V), 0.0), 5.0);
         float specPower = mix(96.0, 28.0, roughness);
         float specDot = max(dot(specN, H), 0.0);
-        float macroSpecDot = max(dot(shadeN, H), 0.0);
+        // clearCoat / broadHotspot deliberately use the smooth macro normal
+        // (not the bump-perturbed one) so the big specular blob stays round
+        // and the bump detail only modulates the sharper spec term.
+        float macroSpecDot = max(dot(macroN, H), 0.0);
         float spec = pow(specDot, specPower) * mix(0.24, 0.10, roughness);
-        float clearCoat = pow(macroSpecDot, 36.0) * 1.05;
-        float broadHotspot = smoothstep(0.52, 0.98, macroSpecDot) * 0.34;
-        float fresnel = pow(1.0 - max(dot(shadeN, V), 0.0), 3.0);
+        float clearCoat = pow(macroSpecDot, 36.0) * 0.70;
+        float broadHotspot = smoothstep(0.52, 0.98, macroSpecDot) * 0.18;
+        float fresnel = pow(1.0 - macroFacing, 3.0);
 
-        float hemi = clamp(shadeN.y * 0.5 + 0.5, 0.0, 1.0);
+        float hemi = clamp(macroN.y * 0.5 + 0.5, 0.0, 1.0);
         float3 ambientSky = float3(0.86, 0.91, 1.0);
         float3 ambientGround = float3(0.55, 0.50, 0.42);
         float3 ambient = albedo * mix(ambientGround, ambientSky, hemi) * 0.64;
@@ -1334,8 +1382,7 @@ final class MetalScene {
         float3 visibleLight = keyTint * (clearCoat + broadHotspot);
         float3 color = diffuse * (1.0 - metallic * 0.30) + specular + rim + visibleLight;
 
-        float facing = max(dot(shadeN, V), 0.0);
-        color *= 0.82 + 0.20 * smoothstep(0.05, 1.0, facing);
+        color *= 0.82 + 0.20 * smoothstep(0.05, 1.0, macroFacing);
 
         float litLuma = dot(color, float3(0.2126, 0.7152, 0.0722));
         color = mix(float3(litLuma), color, 1.08);

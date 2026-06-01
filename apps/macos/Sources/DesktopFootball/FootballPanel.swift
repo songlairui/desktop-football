@@ -3,15 +3,17 @@ import CoreVideo
 import FootballPhysics
 
 enum IdleMotionMode: Int, CaseIterable {
-    case exhibitionSpin
+    case verticalSpin
+    case globeRoll
+    case hangingCharm
     case fingerSpin
-    case physicalRoll
 
     var menuTitle: String {
         switch self {
-        case .exhibitionSpin: return "Exhibition"
-        case .fingerSpin: return "Finger Spin"
-        case .physicalRoll: return "Field Breeze"
+        case .verticalSpin: return "Vertical Spin"
+        case .globeRoll:    return "Globe Roll"
+        case .hangingCharm: return "Hanging Charm"
+        case .fingerSpin:   return "Finger Spin"
         }
     }
 }
@@ -73,9 +75,16 @@ final class FootballPanel: NSPanel {
     private var fingerSpinBurstIndex = 0
     private var fingerSpinBurstCount = 5
     private var fingerSpinCurrentSpeed: CGFloat = 1.2
-    private var physicalRollCountdown: CGFloat = 3.0
-    private var physicalRollDirection: CGFloat = 1
-    private var physicalRollTargetSpeed: CGFloat = 90
+    // Globe roll: physics-driven launch only when the ball has come to rest.
+    // We pick a direction at launch time and let wall restitution + rolling
+    // resistance carry the motion; we don't apply any continuous force.
+    private var globeRollDirection: CGFloat = 1
+    private var globeRollCooldown: CGFloat = 0
+    // Hanging Charm: the ball is suspended from an anchor above the visible
+    // viewport and swings as a 3D pendulum. Only valid in normal gravity; the
+    // menu auto-falls-back to verticalSpin when the user switches to zero /
+    // balloon gravity while the mode is active.
+    private var pendulum: PendulumState?
     private var fpsSampleStart: CFTimeInterval = 0
     private var fpsSampleFrames = 0
     private(set) var measuredFPS: Double = 0
@@ -93,7 +102,7 @@ final class FootballPanel: NSPanel {
     private(set) var isGameMode = false
     private(set) var showsGuideLines = false
     private(set) var showsFPS = false
-    private(set) var idleMotionMode: IdleMotionMode = .exhibitionSpin
+    private(set) var idleMotionMode: IdleMotionMode = .verticalSpin
     private(set) var ballModelKind: BallModelKind = .fifa2026
     private var cursorRingPanel: CursorRingPanel?
     var comboStrikeCount = 2    // 0=off, 2, or 3 — set from menu
@@ -269,6 +278,12 @@ final class FootballPanel: NSPanel {
         config.airDamping60 = mode.airDamping60   // weightless mode drags harder
         ball.isSnapped = false
         sound.setRollSpeed(0)                     // silence rolling audio across the transition
+        // Hanging Charm only makes sense in normal gravity — falling doesn't
+        // land on the floor, and balloon mode would lift the anchor. Drop back
+        // to verticalSpin in those worlds.
+        if mode.gravityY != PhysicsConfig.normalGravity, idleMotionMode == .hangingCharm {
+            setIdleMotionMode(.verticalSpin)
+        }
     }
 
     // MARK: - Lifecycle
@@ -360,8 +375,15 @@ final class FootballPanel: NSPanel {
         }
         chargeFraction = chargeStartTime.map { CGFloat(min(1.0, (now - $0) / 1.5)) } ?? 0
 
-        // ── Ball physics ─────────────────────────────────────────────────────────
-        if ball.isGrabbed {
+        // Hanging Charm owns the ball position. Skip the regular physics step
+        // (gravity / collisions) and the kick / airflow field; the pendulum
+        // keeps the rest of the frame logic happy by reporting `.idle`.
+        if idleMotionMode == .hangingCharm {
+            ball.isSnapped = false
+            ball.isGrabbed = false
+            sound.setRollSpeed(0)
+            motionState = .idle
+        } else if ball.isGrabbed {
             ball.isSnapped = false
             ball.follow(target: CGPoint(x: mouse.x + grabOffset.x, y: mouse.y + grabOffset.y),
                         dt: dt, bounds: bounds, config: config)
@@ -589,9 +611,12 @@ final class FootballPanel: NSPanel {
     }
 
     private var currentRenderEffects: BallRenderEffects {
-        BallRenderEffects(rotationX: visualRotationX,
-                          rotationY: visualRotationY,
-                          rotationZ: visualRotationZ)
+        let charm = hangingCharmOverride
+        return BallRenderEffects(rotationX: visualRotationX,
+                                 rotationY: visualRotationY,
+                                 rotationZ: visualRotationZ,
+                                 overrideWorldPosition: charm?.worldPosition,
+                                 ropeAnchor: charm?.ropeAnchor)
     }
 
     private func resetVisual3D() {
@@ -614,17 +639,20 @@ final class FootballPanel: NSPanel {
         fingerSpinBurstIndex = 0
         fingerSpinBurstCount = Int.random(in: 3...7)
         fingerSpinCurrentSpeed = fingerSpinBaseSpeed
-        physicalRollDirection = Bool.random() ? 1 : -1
-        physicalRollTargetSpeed = CGFloat.random(in: 70...140) * physicalRollDirection
-        physicalRollCountdown = CGFloat.random(in: 4.0...8.0)
+        globeRollDirection = Bool.random() ? 1 : -1
+        globeRollCooldown = 0
+        // Drop the pendulum so the next time hangingCharm is selected (or the
+        // current mode re-enters a fresh state) it gets a clean initial kick
+        // from `makeFreshHangingCharmState()`.
+        pendulum = nil
     }
 
     private func updateVisual3D(dt: CGFloat, motionState: MotionState) {
         guard dt > 0 else { return }
         switch idleMotionMode {
-        case .exhibitionSpin:
+        case .verticalSpin:
             if motionState == .idle {
-                updateExhibitionSpinIdle(dt: dt)
+                updateVerticalSpinIdle(dt: dt)
             } else {
                 decayExtraSpin(dt: dt, damping60: 0.90)
             }
@@ -635,12 +663,15 @@ final class FootballPanel: NSPanel {
                 let damping60: CGFloat = motionState == .grabbed ? 0.90 : 0.994
                 decayExtraSpin(dt: dt, damping60: damping60)
             }
-        case .physicalRoll:
-            if isFieldBreezeEligible(motionState: motionState) {
-                updateFieldBreezeIdle(dt: dt, motionState: motionState)
+        case .globeRoll:
+            if isGlobeRollEligible(motionState: motionState) {
+                updateGlobeRollIdle(dt: dt, motionState: motionState)
             } else {
                 decayExtraSpin(dt: dt, damping60: 0.90)
+                visualSpinVelocityY = 0
             }
+        case .hangingCharm:
+            updateHangingCharmIdle(dt: dt)
         }
 
         visualRotationX += visualSpinVelocityX * dt
@@ -648,22 +679,15 @@ final class FootballPanel: NSPanel {
         visualRotationZ += visualSpinVelocityZ * dt
     }
 
-    // MARK: Exhibition Spin — slow, steady turntable rotation for display.
-    private static let exhibitionSpinSpeed: CGFloat = 8.0   // °/s – gentle turntable pace
+    // MARK: Vertical Spin — steady Y-axis turntable, no tilt, no wobble.
+    private static let verticalSpinSpeed: CGFloat = 0.6   // rad/s ≈ one rotation per ~10.5 s
 
-    private func updateExhibitionSpinIdle(dt: CGFloat) {
-        // Damp any residual extra spin from kicks toward zero.
+    private func updateVerticalSpinIdle(dt: CGFloat) {
+        // Damp any residual X/Z spin left over from kicks; Y is driven by the
+        // constant target so the turntable axis is the only motion in idle.
         decayExtraSpin(dt: dt, damping60: 0.96)
-
-        // Slow, steady Y-axis rotation. Smoothly ramp up from standstill.
-        let target = Self.exhibitionSpinSpeed
-        let ramp: CGFloat = 0.4   // seconds to reach ~63 %
-        let alpha = 1 - exp(-dt / ramp)
-        visualSpinVelocityY += (target - visualSpinVelocityY) * alpha
-
-        // A very subtle X-axis wobble so it doesn't look robotic.
-        idleSpinPhase += dt
-        visualRotationX += 0.15 * CGFloat(sin(idleSpinPhase * 0.35))
+        let blend = 1 - pow(0.10, dt)   // ~0.3 s blend so a kick settles in smoothly
+        visualSpinVelocityY += (Self.verticalSpinSpeed - visualSpinVelocityY) * blend
     }
 
     private func updateFingerSpinIdle(dt: CGFloat) {
@@ -725,32 +749,120 @@ final class FootballPanel: NSPanel {
         visualSpinVelocityZ += (targetZ - visualSpinVelocityZ) * tiltBlend
     }
 
-    private func updateFieldBreezeIdle(dt: CGFloat, motionState: MotionState) {
+    // MARK: Globe Roll — physics-driven: launch, then let walls & friction do
+    // all the work. No continuous force, no mid-roll direction change. The ball
+    // rolls in one direction, reflects off a wall with restitution, decays, and
+    // eventually stops; we wait a short pause and launch again (in the same
+    // direction most of the time, occasionally flipped for variety).
+
+    private static let globeRollLaunchSpeed: CGFloat = 130
+    private static let globeRollStopSpeed: CGFloat = 22
+    private static let globeRollCooldownMin: CGFloat = 0.8
+    private static let globeRollCooldownMax: CGFloat = 2.2
+
+    private func updateGlobeRollIdle(dt: CGFloat, motionState: MotionState) {
+        // No Y turntable while rolling — the surface is doing all the rotation.
+        visualSpinVelocityY = 0
+        // Damp any residual X/Z spin from kicks.
         decayExtraSpin(dt: dt, damping60: 0.88)
 
-        guard isFieldBreezeEligible(motionState: motionState) else { return }
+        guard isGlobeRollEligible(motionState: motionState) else { return }
 
-        physicalRollCountdown -= dt
-        if physicalRollCountdown <= 0 {
-            if Double.random(in: 0...1) < 0.32 { physicalRollDirection *= -1 }
-            physicalRollTargetSpeed = CGFloat.random(in: 55...155) * physicalRollDirection
-            physicalRollCountdown = CGFloat.random(in: 5.5...11.0)
+        let speed = abs(ball.velocity.x)
+        // Only act when the ball is essentially at rest. Once launched, hands
+        // off — BallState.resolveCollisions handles the wall bounce and
+        // BallState.updateSpin couples the texture rotation to velocity.
+        guard speed < Self.globeRollStopSpeed else {
+            globeRollCooldown = max(globeRollCooldown, 0.4)
+            return
         }
 
-        let blend = 1 - pow(0.965, dt * 60.0)
-        ball.velocity.x += (physicalRollTargetSpeed - ball.velocity.x) * blend
+        globeRollCooldown -= dt
+        guard globeRollCooldown <= 0 else { return }
+
+        // Launch in the current direction. After this we deliberately do NOT
+        // apply any force — restitution (0.74) and rolling resistance (0.95)
+        // carry the motion to its natural end.
+        let launchSpeed = Self.globeRollLaunchSpeed
+            * CGFloat.random(in: 0.85...1.10)
+        ball.velocity.x = globeRollDirection * launchSpeed
+        // Make sure the rolling-coupling spin follows from frame one.
+        ball.angularVelocity = -ball.velocity.x / max(config.radius, 1)
+        // Wait for the ball to actually stop and rest before relaunching again.
+        globeRollCooldown = CGFloat.random(in: Self.globeRollCooldownMin...Self.globeRollCooldownMax)
+        // 50/50 chance to flip the launch direction for the next round.
+        if Bool.random() { globeRollDirection *= -1 }
     }
 
-    private func isFieldBreezeEligible(motionState: MotionState) -> Bool {
+    private func isGlobeRollEligible(motionState: MotionState) -> Bool {
         guard ball.isResting(config: config, bounds: bounds) else { return false }
         switch motionState {
         case .idle:
             return true
         case .rolling:
-            return hypot(ball.velocity.x, ball.velocity.y) < 240
+            return hypot(ball.velocity.x, ball.velocity.y) < 320
         case .flying, .grabbed:
             return false
         }
+    }
+
+    // MARK: Hanging Charm — 3D pendulum. The ball is suspended from an anchor
+    // above the visible viewport; the anchor stays fixed, the ball swings as
+    // a damped oscillator with a persistent breeze, and clicks on the ball
+    // give it a one-shot nudge.
+    //
+    // Coordinate convention here matches `screenToTankWorld`: world XY is the
+    // tank floor plane (Y up), Z is depth out of the screen. The anchor sits
+    // at tank height + a small margin, in the middle of the tank. The rope
+    // length is chosen so the ball at rest hangs roughly at viewport midY,
+    // giving it room to swing without colliding with the floor.
+
+    private static let hangingCharmRopeLength: Float = 520
+    private static let hangingCharmInitialKick: Float = 95
+    private static let hangingCharmNudgeScale: Float = 240
+    private static let hangingCharmShadowLift: Float = 1.45   // shadow grows when ball is high
+
+    /// Build a fresh pendulum state anchored above the centre of the tank and
+    /// give the ball a small initial sideways kick so it doesn't hang dead.
+    private func makeFreshHangingCharmState() -> PendulumState {
+        // World Y is the tank height (620) at the top, 0 at the floor. Place
+        // the anchor well above the ceiling so the rope disappears off the
+        // top of the visible viewport. X = 0 is the tank's horizontal centre.
+        let anchorX: Float = 0
+        let anchorY: Float = 620 + 90
+        let anchorZ: Float = 0
+
+        var state = PendulumState(
+            anchor: SIMD3<Float>(anchorX, anchorY, anchorZ),
+            ropeLength: Self.hangingCharmRopeLength
+        )
+        // Initial sideways kick: a small Y bias is also added so the first
+        // arc isn't a perfectly straight line.
+        state.velocity = SIMD3<Float>(Self.hangingCharmInitialKick, 35, 0)
+        return state
+    }
+
+    private func updateHangingCharmIdle(dt: CGFloat) {
+        // No Y turntable and no X tilt while hanging — the swing is the motion.
+        visualSpinVelocityY = 0
+        visualSpinVelocityX *= pow(0.85, dt * 60.0)
+        visualSpinVelocityZ *= pow(0.85, dt * 60.0)
+
+        if pendulum == nil {
+            pendulum = makeFreshHangingCharmState()
+        }
+        guard var p = pendulum else { return }
+        p.step(dt: Float(dt))
+        pendulum = p
+    }
+
+    /// World position the ball should be drawn at this frame. When the
+    /// hanging-charm mode is active, returns the pendulum's world position
+    /// (which includes real Z depth). Otherwise returns nil so the renderer
+    /// falls back to projecting `BallState.center` onto the Z=0 plane.
+    var hangingCharmOverride: (worldPosition: SIMD3<Float>, ropeAnchor: SIMD3<Float>)? {
+        guard idleMotionMode == .hangingCharm, let p = pendulum else { return nil }
+        return (p.worldPosition, p.anchor)
     }
 
     private func decayExtraSpin(dt: CGFloat, damping60: CGFloat) {
@@ -983,6 +1095,37 @@ final class FootballPanel: NSPanel {
 
     override func mouseDown(with event: NSEvent) {
         let m = NSEvent.mouseLocation
+
+        // Hanging Charm: a click on the ball nudges the pendulum. The ball is
+        // not grabbable — drag is ignored, and the click impulse comes from
+        // the direction mouse → ball so the swing feels like a push.
+        if idleMotionMode == .hangingCharm, let p = pendulum {
+            let projected = projectHangingCharmBallToScreen()
+            let dx = m.x - projected.x
+            let dy = m.y - projected.y
+            let dist = hypot(dx, dy)
+            if dist <= config.radius {
+                // Push direction = away from the mouse (mouse "flicked" the ball).
+                let ndx = dx / max(dist, 0.001)
+                let ndy = dy / max(dist, 0.001)
+                let strength = Self.hangingCharmNudgeScale
+                    * Float.random(in: 0.85...1.15)
+                let push = SIMD3<Float>(
+                    Float(ndx) * strength,
+                    Float(ndy) * strength * 0.45,   // a touch of Y for arc
+                    Float.random(in: -40...40)      // bit of Z for depth swing
+                )
+                _ = p
+                pendulum?.nudge(impulse: push)
+                sound.playKick(strength: 280)
+                return
+            }
+            // Click missed the ball — fall through to the normal "ignore" path.
+            interactive = false
+            ignoresMouseEvents = true
+            return
+        }
+
         guard ball.isGrabbed || ball.isSnapped || distanceFromBall(m) <= glassGrabRadius else {
             interactive = false
             ignoresMouseEvents = true
@@ -993,6 +1136,21 @@ final class FootballPanel: NSPanel {
         ball.isGrabbed = true
         ball.isSnapped = false
         grabOffset = CGPoint(x: ball.center.x - m.x, y: ball.center.y - m.y)
+    }
+
+    /// Project the pendulum's world position back to screen coordinates so the
+    /// mouse hit-test can use the same numbers the renderer is drawing with.
+    private func projectHangingCharmBallToScreen() -> CGPoint {
+        guard let p = pendulum else { return ball.center }
+        // The renderer uses the window frame as viewport; mirror that here.
+        // We can't call `MetalScene.tankPointsToWorld` (private), so we use
+        // the canonical tank height (620) it itself hardcodes.
+        let viewport: NSRect = frame
+        let tankHeight: CGFloat = 620
+        let pointsToWorld = tankHeight / max(viewport.height, 1)
+        let x = CGFloat(p.worldPosition.x) / pointsToWorld + viewport.midX
+        let y = CGFloat(p.worldPosition.y) / pointsToWorld + viewport.minY
+        return CGPoint(x: x, y: y)
     }
 
     private func distanceFromBall(_ point: NSPoint) -> CGFloat {

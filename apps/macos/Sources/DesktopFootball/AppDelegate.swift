@@ -162,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildIdleMotionMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Idle Motion", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
-        let current = panel?.idleMotionMode ?? .exhibitionSpin
+        let current = panel?.idleMotionMode ?? .verticalSpin
         idleMotionItems = IdleMotionMode.allCases.map { mode in
             let item = NSMenuItem(title: mode.menuTitle, action: #selector(setIdleMotion(_:)), keyEquivalent: "")
             item.target = self

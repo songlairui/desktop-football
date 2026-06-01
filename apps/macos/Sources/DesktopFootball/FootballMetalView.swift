@@ -19,8 +19,19 @@ struct BallRenderEffects {
     var rotationX: CGFloat
     var rotationY: CGFloat
     var rotationZ: CGFloat
+    /// World-space override of the ball position. When non-nil, the renderer
+    /// uses this instead of the projection of `BallState.center` — the
+    /// "Hanging Charm" mode sets it to the pendulum's world position so the
+    /// ball can move in true 3D (including Z depth) rather than just on the
+    /// screen plane.
+    var overrideWorldPosition: SIMD3<Float>?
+    /// When non-nil, draws a thin line from this anchor to the ball world
+    /// position. Used by the Hanging Charm mode to show the rope.
+    var ropeAnchor: SIMD3<Float>?
 
-    static let neutral = BallRenderEffects(rotationX: 0, rotationY: 0, rotationZ: 0)
+    static let neutral = BallRenderEffects(rotationX: 0, rotationY: 0, rotationZ: 0,
+                                            overrideWorldPosition: nil,
+                                            ropeAnchor: nil)
 }
 
 /// A plain `NSView` backed by a `CAMetalLayer` that owns the Metal rendering

@@ -1339,7 +1339,7 @@ final class MetalScene {
 
         float litLuma = dot(color, float3(0.2126, 0.7152, 0.0722));
         color = mix(float3(litLuma), color, 1.08);
-        color = clamp(color * 1.20, 0.0, 1.0);
+        color = clamp(color * 1.05, 0.0, 1.0);
         color = pow(color, float3(1.0 / 2.2));
 
         return float4(color, 1.0);

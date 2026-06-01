@@ -3,11 +3,13 @@ import CoreVideo
 import FootballPhysics
 
 enum IdleMotionMode: Int, CaseIterable {
+    case exhibitionSpin
     case fingerSpin
     case physicalRoll
 
     var menuTitle: String {
         switch self {
+        case .exhibitionSpin: return "Exhibition"
         case .fingerSpin: return "Finger Spin"
         case .physicalRoll: return "Field Breeze"
         }
@@ -91,7 +93,7 @@ final class FootballPanel: NSPanel {
     private(set) var isGameMode = false
     private(set) var showsGuideLines = false
     private(set) var showsFPS = false
-    private(set) var idleMotionMode: IdleMotionMode = .fingerSpin
+    private(set) var idleMotionMode: IdleMotionMode = .exhibitionSpin
     private(set) var ballModelKind: BallModelKind = .fifa2026
     private var cursorRingPanel: CursorRingPanel?
     var comboStrikeCount = 2    // 0=off, 2, or 3 — set from menu
@@ -620,6 +622,12 @@ final class FootballPanel: NSPanel {
     private func updateVisual3D(dt: CGFloat, motionState: MotionState) {
         guard dt > 0 else { return }
         switch idleMotionMode {
+        case .exhibitionSpin:
+            if motionState == .idle {
+                updateExhibitionSpinIdle(dt: dt)
+            } else {
+                decayExtraSpin(dt: dt, damping60: 0.90)
+            }
         case .fingerSpin:
             if motionState == .idle {
                 updateFingerSpinIdle(dt: dt)
@@ -638,6 +646,24 @@ final class FootballPanel: NSPanel {
         visualRotationX += visualSpinVelocityX * dt
         visualRotationY += visualSpinVelocityY * dt
         visualRotationZ += visualSpinVelocityZ * dt
+    }
+
+    // MARK: Exhibition Spin — slow, steady turntable rotation for display.
+    private static let exhibitionSpinSpeed: CGFloat = 8.0   // °/s – gentle turntable pace
+
+    private func updateExhibitionSpinIdle(dt: CGFloat) {
+        // Damp any residual extra spin from kicks toward zero.
+        decayExtraSpin(dt: dt, damping60: 0.96)
+
+        // Slow, steady Y-axis rotation. Smoothly ramp up from standstill.
+        let target = Self.exhibitionSpinSpeed
+        let ramp: CGFloat = 0.4   // seconds to reach ~63 %
+        let alpha = 1 - exp(-dt / ramp)
+        visualSpinVelocityY += (target - visualSpinVelocityY) * alpha
+
+        // A very subtle X-axis wobble so it doesn't look robotic.
+        idleSpinPhase += dt
+        visualRotationX += 0.15 * CGFloat(sin(idleSpinPhase * 0.35))
     }
 
     private func updateFingerSpinIdle(dt: CGFloat) {
@@ -827,7 +853,14 @@ final class FootballPanel: NSPanel {
     }
 
     private static func playArea(for screen: NSScreen) -> Bounds {
-        Bounds(rect: screen.frame.insetByBottom(dockClearance))
+        let frame = screen.frame
+        let menuBarHeight = frame.height - screen.visibleFrame.maxY
+        return Bounds(rect: CGRect(
+            x: frame.minX,
+            y: frame.minY + dockClearance,
+            width: frame.width,
+            height: frame.height - dockClearance - menuBarHeight
+        ))
     }
 
     private func screen(containing point: CGPoint) -> NSScreen? {

@@ -1,25 +1,22 @@
 import AppKit
 
-/// A fullscreen, always-click-through, transparent NSPanel that renders combo
-/// strike "shockwave" ripples at arbitrary screen positions — free of the ball
-/// window's 170×170 clip rectangle.
+/// A small, always-click-through, transparent NSPanel that renders combo strike
+/// "shockwave" ripples near the impact point.
 ///
 /// Effects are drawn at the ball's **global screen coordinates** (same space as
-/// `NSEvent.mouseLocation`), converted to panel-local coords via `frame.minX/Y`.
-/// The panel covers the union of all connected displays so effects look correct
-/// on any monitor.
+/// `NSEvent.mouseLocation`). Older versions covered the union of all displays,
+/// which made a transparent overlay participate in composition on secondary
+/// monitors. Keep this panel tightly bounded around the effect instead.
 final class EffectsOverlayPanel: NSPanel {
 
     static let shared = EffectsOverlayPanel()
 
-    private init() {
-        let screens = NSScreen.screens
-        let fullRect = screens.isEmpty
-            ? NSRect(x: 0, y: 0, width: 1440, height: 900)
-            : screens.dropFirst().reduce(screens[0].frame) { $0.union($1.frame) }
+    private let panelSize: CGFloat = 420
+    private var halfSize: CGFloat { panelSize / 2 }
 
+    private init() {
         super.init(
-            contentRect: fullRect,
+            contentRect: NSRect(x: -10_000, y: -10_000, width: panelSize, height: panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
@@ -30,22 +27,26 @@ final class EffectsOverlayPanel: NSPanel {
         ignoresMouseEvents = true
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
 
-        let cv = NSView(frame: fullRect)
+        let cv = NSView(frame: NSRect(x: 0, y: 0, width: panelSize, height: panelSize))
         cv.wantsLayer = true
         cv.layer?.masksToBounds = false
         contentView = cv
-
-        orderFrontRegardless()
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    private func prepareEffect(at screenPos: CGPoint) -> CGPoint {
+        setFrameOrigin(NSPoint(x: screenPos.x - halfSize, y: screenPos.y - halfSize))
+        orderFrontRegardless()
+        return CGPoint(x: halfSize, y: halfSize)
+    }
 
     /// Fruit-Ninja–style slash mark at `screenPos`, oriented perpendicular to the
     /// strike impulse direction. Two layers: a wide soft glow + a razor-thin bright
     /// core, both fading in ~0.22 s.
     func showSlashEffect(at screenPos: CGPoint, angle: CGFloat, power: CGFloat = 1.0) {
         guard let root = contentView?.layer else { return }
-        let localPos = CGPoint(x: screenPos.x - frame.minX, y: screenPos.y - frame.minY)
+        let localPos = prepareEffect(at: screenPos)
 
         // The blade cuts ACROSS the motion, not along it (perpendicular + small jitter).
         let slashAngle = angle + .pi / 2 + CGFloat.random(in: -0.25...0.25)
@@ -93,8 +94,7 @@ final class EffectsOverlayPanel: NSPanel {
     ///   • power  > 1.00 → 4 rings, max radius ~140pt  (mega-combo finale)
     func showStrikeEffect(at screenPos: CGPoint, power: CGFloat = 1.0) {
         guard let root = contentView?.layer else { return }
-        let localPos = CGPoint(x: screenPos.x - frame.minX,
-                               y: screenPos.y - frame.minY)
+        let localPos = prepareEffect(at: screenPos)
 
         let numRings = power > 1.0 ? 4 : (power > 0.85 ? 3 : 2)
         let maxRadius: CGFloat = 55 + 85 * power   // 55→140pt as power rises

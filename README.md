@@ -63,6 +63,6 @@ apps/macos/
 - ✅ P0 (R1–R6)：重力+碰撞、足球渲染+旋转、踢球交互、边界反弹、摩擦停止、独立窗口
 - ✅ P1 大部分 (R7/R8/R11/R12)：阴影透视、squash & stretch、长按拖拽抛出、静止呼吸
 - ✅ 声音 (R10)：程序化合成踢球/弹跳/滚动声，可开关
-- ⏳ 后续：粒子 R9（`CAEmitterLayer`）、多球类型 R13、自定义纹理 R16、节日主题 R17
+- ⏳ 后续：粒子 R9（`CAEmitterLayer`）、多球类型 R13、自定义纹理 R16、节日主题 R17、CLI / 异步任务联动 R18、运动跟随相机视差 R19、透视方案切换 R20
 
 需求文档见 `docs/specs/desktop-football.md`，缘起见 `docs/kickoff/START.md`。

@@ -12,6 +12,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var gravityItems: [NSMenuItem] = []
     private var gameModeItem: NSMenuItem?
     private var cruiseModeItem: NSMenuItem?
+    private var guideLinesItem: NSMenuItem?
+    private var fpsItem: NSMenuItem?
+    private var idleMotionItems: [NSMenuItem] = []
+    private var ballModelItems: [NSMenuItem] = []
     private var comboItems: [NSMenuItem] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -54,6 +58,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(buildGravityMenuItem())
 
+        menu.addItem(buildBallModelMenuItem())
+
         menu.addItem(.separator())
 
         let gm = NSMenuItem(title: "Game Mode", action: #selector(toggleGameMode), keyEquivalent: "g")
@@ -64,10 +70,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(buildComboMenuItem())
 
+        menu.addItem(buildIdleMotionMenuItem())
+
         let cruise = NSMenuItem(title: "Cruise Mode", action: #selector(toggleCruiseMode), keyEquivalent: "")
         cruise.target = self; cruise.state = .off
         menu.addItem(cruise)
         cruiseModeItem = cruise
+
+        let guides = NSMenuItem(title: "Guide Lines", action: #selector(toggleGuideLines), keyEquivalent: "")
+        guides.target = self
+        guides.state = .off
+        menu.addItem(guides)
+        guideLinesItem = guides
+
+        let fps = NSMenuItem(title: "Show FPS", action: #selector(toggleFPS), keyEquivalent: "")
+        fps.target = self
+        fps.state = .off
+        menu.addItem(fps)
+        fpsItem = fps
 
         menu.addItem(.separator())
 
@@ -103,6 +123,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return parent
     }
 
+    /// "Ball Model" submenu — switch between bundled USDZ ball meshes.
+    private func buildBallModelMenuItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Ball Model", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let current = panel?.ballModelKind ?? .fifa2026
+        ballModelItems = BallModelKind.allCases.map { kind in
+            let item = NSMenuItem(title: kind.menuTitle, action: #selector(setBallModel(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = kind
+            item.state = kind == current ? .on : .off
+            submenu.addItem(item)
+            return item
+        }
+        parent.submenu = submenu
+        return parent
+    }
+
     /// "Combo Strikes" submenu — how many phantom hits fire on a standard combo.
     private func buildComboMenuItem() -> NSMenuItem {
         let parent = NSMenuItem(title: "Combo Strikes", action: nil, keyEquivalent: "")
@@ -114,6 +151,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.tag = count
             item.state = count == current ? .on : .off
+            submenu.addItem(item)
+            return item
+        }
+        parent.submenu = submenu
+        return parent
+    }
+
+    /// "Idle Motion" submenu — what the ball does only while fully at rest.
+    private func buildIdleMotionMenuItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Idle Motion", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let current = panel?.idleMotionMode ?? .verticalSpin
+        idleMotionItems = IdleMotionMode.allCases.map { mode in
+            let item = NSMenuItem(title: mode.menuTitle, action: #selector(setIdleMotion(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = mode
+            item.state = mode == current ? .on : .off
             submenu.addItem(item)
             return item
         }
@@ -135,6 +189,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let newValue = !panel.isGameMode
         panel.setGameMode(newValue)
         gameModeItem.state = newValue ? .on : .off
+    }
+
+    @objc private func toggleGuideLines() {
+        guard let panel, let guideLinesItem else { return }
+        let newValue = !panel.showsGuideLines
+        panel.setGuideLines(newValue)
+        guideLinesItem.state = newValue ? .on : .off
+    }
+
+    @objc private func toggleFPS() {
+        guard let panel, let fpsItem else { return }
+        let newValue = !panel.showsFPS
+        panel.setFPSVisible(newValue)
+        fpsItem.state = newValue ? .on : .off
+    }
+
+    @objc private func setIdleMotion(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? IdleMotionMode else { return }
+        panel?.setIdleMotionMode(mode)
+        for item in idleMotionItems {
+            item.state = (item.representedObject as? IdleMotionMode == mode) ? .on : .off
+        }
+    }
+
+    @objc private func setBallModel(_ sender: NSMenuItem) {
+        guard let kind = sender.representedObject as? BallModelKind else { return }
+        panel?.setBallModel(kind)
+        for item in ballModelItems {
+            item.state = (item.representedObject as? BallModelKind == kind) ? .on : .off
+        }
     }
 
     @objc private func setCombo(_ sender: NSMenuItem) {

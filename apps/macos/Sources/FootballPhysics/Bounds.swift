@@ -1,8 +1,8 @@
 import CoreGraphics
 
 /// The rectangular play area the ball is confined to, expressed in screen
-/// coordinates (the screen's `visibleFrame`, so the ball never slides under the
-/// menu bar or behind the Dock).
+/// coordinates. DesktopFootball currently uses the screen viewport with a fixed
+/// bottom clearance so the ball rests above the Dock area consistently.
 ///
 /// Positions tracked by the physics engine are **ball centres**, so the usable
 /// span for a centre is the frame inset by the ball radius on every side.

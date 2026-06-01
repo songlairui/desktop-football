@@ -302,7 +302,8 @@ final class MetalScene {
         uniforms.localModel = ballLocalTransform
         uniforms.squash = 0
         uniforms.ballRadius = visualRadius
-        uniforms.lightPos = SIMD3<Float>(-220, mapping.height + 520, 680)
+        let sunDirection = simd_normalize(SIMD3<Float>(-0.55, 0.70, 0.45))
+        uniforms.lightPos = sunDirection
         uniforms.viewPos = camera.eye(frontHeight: mapping.height)
 
         // The desktop is the visible ground; draw only local helper lines so the
@@ -317,23 +318,42 @@ final class MetalScene {
             drawRope(encoder: encoder, from: ropeAnchor, to: worldBall)
         }
 
-        // ── Shadow disc ───────────────────────────────────────────────────────
+        // ── Shadow discs ──────────────────────────────────────────────────────
         encoder.setRenderPipelineState(shadowPipeline)
         encoder.setDepthStencilState(makeDepthState(device, readOnly: true))
-        var shadowUniforms = uniforms
-        let shadowScale = visualRadius * 1.08
-        shadowUniforms.model = float4x4(translation: SIMD3<Float>(worldBall.x, mapping.floorY + 0.5, worldBall.z))
-            * float4x4(scale: SIMD3<Float>(shadowScale, shadowScale, shadowScale))
-        encoder.setVertexBytes(&shadowUniforms, length: MemoryLayout<SceneUniforms>.stride, index: 1)
         let svBuf = shadowMesh.vertexBuffers[0]
         encoder.setVertexBuffer(svBuf.buffer, offset: svBuf.offset, index: 0)
-        for sub in shadowMesh.submeshes {
-            encoder.drawIndexedPrimitives(type: sub.primitiveType,
-                                          indexCount: sub.indexCount,
-                                          indexType: sub.indexType,
-                                          indexBuffer: sub.indexBuffer.buffer,
-                                          indexBufferOffset: sub.indexBuffer.offset)
+
+        func drawShadow(_ shadowUniforms: inout SceneUniforms) {
+            encoder.setVertexBytes(&shadowUniforms, length: MemoryLayout<SceneUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&shadowUniforms, length: MemoryLayout<SceneUniforms>.stride, index: 1)
+            for sub in shadowMesh.submeshes {
+                encoder.drawIndexedPrimitives(type: sub.primitiveType,
+                                              indexCount: sub.indexCount,
+                                              indexType: sub.indexType,
+                                              indexBuffer: sub.indexBuffer.buffer,
+                                              indexBufferOffset: sub.indexBuffer.offset)
+            }
         }
+
+        var wallShadowUniforms = uniforms
+        wallShadowUniforms.squash = 1
+        let wallShadowScale = visualRadius * 1.16
+        let wallShadowOffset = SIMD3<Float>(
+            -sunDirection.x * visualRadius * 0.58,
+            -sunDirection.y * visualRadius * 0.46,
+            -visualRadius * 0.82
+        )
+        wallShadowUniforms.model = float4x4(translation: worldBall + wallShadowOffset)
+            * float4x4(scale: SIMD3<Float>(wallShadowScale * 1.04, wallShadowScale * 0.96, 1))
+        drawShadow(&wallShadowUniforms)
+
+        var contactShadowUniforms = uniforms
+        contactShadowUniforms.squash = 0
+        let contactShadowScale = visualRadius * 0.82
+        contactShadowUniforms.model = float4x4(translation: SIMD3<Float>(worldBall.x, mapping.floorY + 0.5, worldBall.z))
+            * float4x4(scale: SIMD3<Float>(contactShadowScale, contactShadowScale, contactShadowScale))
+        drawShadow(&contactShadowUniforms)
 
         // ── Ball ──────────────────────────────────────────────────────────────
         encoder.setRenderPipelineState(ballPipeline)
@@ -632,14 +652,14 @@ final class MetalScene {
         Self.drawSubtleEmboss(ctx, size: s)
 
         // Upload to MTLTexture
-        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb,
                                                            width: size, height: size,
                                                            mipmapped: false)
         td.usage = [.shaderRead]
         guard let tex = device.makeTexture(descriptor: td) else {
             return Self.fallbackTexture(device: device)
         }
-        // CGContext writes RGBA; Metal .bgra8Unorm expects BGRA, so swap R/B.
+        // CGContext writes RGBA; Metal BGRA expects BGRA, so swap R/B.
         for i in 0..<(size * size) {
             let base = i * 4
             data.swapAt(base, base + 2)  // swap R and B
@@ -720,7 +740,7 @@ final class MetalScene {
             strokeSeam(curve, width: 0.024)
         }
 
-        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb,
                                                            width: size, height: size,
                                                            mipmapped: false)
         td.usage = [.shaderRead]
@@ -761,7 +781,7 @@ final class MetalScene {
         Self.drawSoccerLeatherGrain(ctx, size: s)
         Self.drawClassicSoccerPanels(ctx, size: s)
 
-        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb,
                                                            width: size, height: size,
                                                            mipmapped: false)
         td.usage = [.shaderRead]
@@ -1211,7 +1231,7 @@ final class MetalScene {
     }
 
     private static func fallbackTexture(device: MTLDevice) -> MTLTexture {
-        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb,
                                                            width: 4, height: 4, mipmapped: false)
         td.usage = [.shaderRead]
         let tex = device.makeTexture(descriptor: td)!
@@ -1310,6 +1330,28 @@ final class MetalScene {
         return out;
     }
 
+    float pbrDistributionGGX(float NdotH, float roughness) {
+        float a = roughness * roughness;
+        float a2 = a * a;
+        float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+        return a2 / max(3.14159265 * denom * denom, 0.0001);
+    }
+
+    float pbrGeometrySchlickGGX(float NdotV, float roughness) {
+        float r = roughness + 1.0;
+        float k = (r * r) * 0.125;
+        return NdotV / max(NdotV * (1.0 - k) + k, 0.0001);
+    }
+
+    float pbrGeometrySmith(float NdotV, float NdotL, float roughness) {
+        return pbrGeometrySchlickGGX(NdotV, roughness) *
+               pbrGeometrySchlickGGX(NdotL, roughness);
+    }
+
+    float3 pbrFresnelSchlick(float cosTheta, float3 F0) {
+        return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+    }
+
     fragment float4 ballFragment(BallVertexOut in [[stage_in]],
                                  constant SceneUniforms &u [[buffer(1)]],
                                  texture2d<float> skinTexture [[texture(0)]],
@@ -1318,7 +1360,10 @@ final class MetalScene {
                                  texture2d<float> roughnessTexture [[texture(3)]],
                                  sampler texSampler [[sampler(0)]]) {
         float3 macroN = normalize(in.worldNormal);
-        float3 T = normalize(in.worldTangent - macroN * dot(macroN, in.worldTangent));
+        float3 fallbackT = normalize(cross(abs(macroN.y) < 0.9 ? float3(0, 1, 0) : float3(1, 0, 0), macroN));
+        float3 rawT = in.worldTangent - macroN * dot(macroN, in.worldTangent);
+        float tangentWeight = step(0.0001, length(rawT));
+        float3 T = normalize(mix(fallbackT, rawT / max(length(rawT), 0.0001), tangentWeight));
         float3 B = normalize(cross(macroN, T));
         float3x3 TBN = float3x3(T, B, macroN);
 
@@ -1329,64 +1374,79 @@ final class MetalScene {
         float luma = dot(albedo, float3(0.2126, 0.7152, 0.0722));
         float chroma = length(albedo - float3(luma));
         float colorMask = smoothstep(0.035, 0.16, chroma);
-        float saturation = mix(1.12, 2.05, colorMask);
-        albedo = clamp(mix(float3(luma), albedo, saturation), 0.0, 1.0);
-        albedo = clamp(mix(albedo, mix(float3(0.5), albedo, 1.12), colorMask), 0.0, 1.0);
-        float metallic = clamp(metallicTexture.sample(texSampler, in.uv).r * 0.25, 0.0, 0.12);
-        float roughness = clamp(roughnessTexture.sample(texSampler, in.uv).r, 0.35, 0.75);
-
         float3 V = normalize(u.viewPos - in.worldPos);
         float macroFacing = max(dot(macroN, V), 0.0);
-        // Bump is dialled out toward the silhouette so the normal map can't
-        // create a halo / muddy edge where macroN is nearly perpendicular to
-        // V.  Center of the ball gets full relief, edge stays smooth.
-        float bumpWeight = smoothstep(0.0, 0.35, macroFacing) * 0.55;
+        float edgeCalm = smoothstep(0.06, 0.64, macroFacing);
+        float saturation = mix(1.10, 1.62, colorMask) * mix(0.90, 1.0, edgeCalm);
+        albedo = clamp(mix(float3(luma), albedo, saturation), 0.0, 1.0);
+        albedo = clamp(albedo * mix(1.04, 1.16, colorMask), 0.0, 1.0);
+        float metallic = clamp(metallicTexture.sample(texSampler, in.uv).r * 0.08, 0.0, 0.05);
+        float roughness = clamp(roughnessTexture.sample(texSampler, in.uv).r, 0.35, 0.75);
+        roughness = mix(max(roughness, 0.62), roughness, edgeCalm);
+
+        // Bump is strongly dialled out at the silhouette so the texture cannot
+        // break the sphere outline. The macro normal still drives the big light
+        // envelope and the fallback clear-coat highlight.
+        float bumpWeight = smoothstep(0.24, 0.78, macroFacing) * 0.48;
         float3 bumpN = normalize(mix(macroN, detailN, bumpWeight));
         float3 shadeN = bumpN;
         float3 specN = bumpN;
-        float3 keyDir = normalize(u.lightPos - in.worldPos);
+        float3 keyDir = normalize(u.lightPos);
         float3 fillDir = normalize(float3(0.55, 0.42, 0.75));
         float3 rimDir = normalize(float3(0.45, 0.25, -0.85));
         float3 H = normalize(keyDir + V);
 
-        float key = max(dot(shadeN, keyDir), 0.0);
+        float NdotV = max(dot(specN, V), 0.03);
+        float NdotL = max(dot(shadeN, keyDir), 0.0);
+        float NdotH = max(dot(specN, H), 0.0);
+        float VdotH = max(dot(V, H), 0.0);
         float fill = max(dot(shadeN, fillDir), 0.0);
         // rim / fresnel / hemi stay on macroN so the ball's overall light
         // envelope (silhouette glow, hemisphere ambient) reads as a clean
         // sphere instead of being chopped up by the bump.
+        float macroKey = max(dot(macroN, keyDir), 0.0);
         float rimLight = max(dot(macroN, rimDir), 0.0);
-        float wrapKey = key * 0.70 + 0.30;
+        float wrapKey = NdotL * 0.72 + 0.28;
 
         float3 keyTint = float3(1.0, 0.91, 0.72);
-        float3 F0 = mix(float3(0.04), albedo, metallic);
-        float3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(H, V), 0.0), 5.0);
-        float specPower = mix(96.0, 28.0, roughness);
-        float specDot = max(dot(specN, H), 0.0);
-        // clearCoat / broadHotspot deliberately use the smooth macro normal
-        // (not the bump-perturbed one) so the big specular blob stays round
-        // and the bump detail only modulates the sharper spec term.
+        float3 fillTint = float3(0.74, 0.82, 1.0);
+        float3 F0 = mix(float3(0.045), albedo, metallic);
+        float D = pbrDistributionGGX(NdotH, roughness);
+        float G = pbrGeometrySmith(NdotV, NdotL, roughness);
+        float3 F = pbrFresnelSchlick(VdotH, F0);
+        float3 specularBRDF = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
+        float3 kD = (1.0 - F) * (1.0 - metallic);
+
+        float3 keyLight = (kD * albedo * (1.0 / 3.14159265) + specularBRDF) *
+                          keyTint * 3.15 * NdotL;
+        float3 fillLight = albedo * fillTint * (0.30 + 0.46 * fill);
+
+        // The physically based F0 on a matte football can be too subtle at this
+        // desktop size. Keep a macro-normal clear coat so the highlight remains
+        // visible even when the normal map or roughness texture is noisy.
         float macroSpecDot = max(dot(macroN, H), 0.0);
-        float spec = pow(specDot, specPower) * mix(0.24, 0.10, roughness);
-        float clearCoat = pow(macroSpecDot, 36.0) * 0.70;
-        float broadHotspot = smoothstep(0.52, 0.98, macroSpecDot) * 0.18;
+        float clearCoat = pow(macroSpecDot, 42.0) * 0.58;
+        float broadHotspot = smoothstep(0.56, 0.98, macroSpecDot) * 0.16;
+        float coatVisibility = smoothstep(0.16, 0.58, macroFacing) * (0.58 + 0.42 * macroKey);
         float fresnel = pow(1.0 - macroFacing, 3.0);
 
         float hemi = clamp(macroN.y * 0.5 + 0.5, 0.0, 1.0);
-        float3 ambientSky = float3(0.86, 0.91, 1.0);
-        float3 ambientGround = float3(0.55, 0.50, 0.42);
-        float3 ambient = albedo * mix(ambientGround, ambientSky, hemi) * 0.64;
+        float3 ambientSky = float3(0.82, 0.88, 1.0);
+        float3 ambientGround = float3(0.46, 0.40, 0.32);
+        float3 ambient = albedo * mix(ambientGround, ambientSky, hemi) * 0.44;
 
-        float3 diffuse = ambient + albedo * (1.16 * wrapKey + 0.42 * fill + 0.24 * key);
-        float3 specular = F * spec * 1.34;
-        float3 rim = float3(0.88, 0.94, 1.0) * (0.10 * rimLight + 0.14 * fresnel);
-        float3 visibleLight = keyTint * (clearCoat + broadHotspot);
-        float3 color = diffuse * (1.0 - metallic * 0.30) + specular + rim + visibleLight;
-
-        color *= 0.82 + 0.20 * smoothstep(0.05, 1.0, macroFacing);
+        float lightEnvelope = mix(0.70, 1.0, smoothstep(-0.12, 0.78, dot(macroN, keyDir)));
+        float viewEnvelope = mix(0.64, 1.0, smoothstep(0.04, 0.86, macroFacing));
+        float3 rim = float3(0.78, 0.86, 1.0) * (0.035 * rimLight + 0.055 * fresnel) * lightEnvelope;
+        float3 visibleLight = keyTint * (clearCoat + broadHotspot) * coatVisibility;
+        float3 color = (ambient + keyLight + fillLight + albedo * 0.44 * wrapKey) *
+                       lightEnvelope * viewEnvelope +
+                       rim + visibleLight;
 
         float litLuma = dot(color, float3(0.2126, 0.7152, 0.0722));
-        color = mix(float3(litLuma), color, 1.08);
-        color = clamp(color * 1.05, 0.0, 1.0);
+        color = mix(float3(litLuma), color, mix(1.12, 1.24, colorMask));
+        color = color / (color + float3(0.74));
+        color = clamp(color * 1.18, 0.0, 1.0);
         color = pow(color, float3(1.0 / 2.2));
 
         return float4(color, 1.0);
@@ -1443,9 +1503,9 @@ final class MetalScene {
     vertex ShadowVertexOut shadowVertex(SurfaceVertexIn in [[stage_in]],
                                         constant SceneUniforms &u [[buffer(1)]]) {
         ShadowVertexOut out;
-        float3 p = float3(in.position.x,
-                          0.0,
-                          in.position.y);
+        float3 p = u.squash > 0.5
+            ? float3(in.position.x, in.position.y, 0.0)
+            : float3(in.position.x, 0.0, in.position.y);
         float4 worldPos = u.model * float4(p, 1.0);
         out.position = u.projection * u.view * worldPos;
         out.uv = in.texCoord;
@@ -1456,7 +1516,14 @@ final class MetalScene {
                                    constant SceneUniforms &u [[buffer(1)]]) {
         float2 c = in.uv - 0.5;
         float dist = length(c) * 2.0;
-        float alpha = smoothstep(1.0, 0.2, dist) * 0.30;
+        if (u.squash > 0.5) {
+            float wallBody = smoothstep(1.0, 0.10, dist) * 0.18;
+            float wallCore = smoothstep(0.56, 0.0, dist) * 0.08;
+            return float4(0, 0, 0, wallBody + wallCore);
+        }
+        float softBody = smoothstep(1.0, 0.18, dist) * 0.26;
+        float contactCore = smoothstep(0.42, 0.0, dist) * 0.18;
+        float alpha = softBody + contactCore;
         return float4(0, 0, 0, alpha);
     }
     """

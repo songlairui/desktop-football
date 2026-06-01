@@ -1,72 +1,71 @@
 # HAND_OFF
 
-> 更新时间：2026-05-31
+> 更新时间：2026-06-01
+
+## 目标
+把桌面 football 从"球的 3D 感全靠 shader 假装"推进到"真的有 3D 运动"——
+本轮三件事：①修 Trionda 球的"2D 贴图感"②重做 idle 模式（让默认稳态好看）③加 Hanging Charm 挂件模式（让球真的在 3D 空间里动）。
 
 ## 当前状态
-Trionda 2026 FIFA 世界杯足球 USDZ 集成已修复到可构建状态。
+完成。本轮 3 项改动全部 build + 43 tests 通过，已 commit 在 `d705c99`。
+下一个可执行动作：实机跑 Hanging Charm，看 Z 摆动产生的"近大远小"是否到位、绳索是否太亮/太暗。
 
-- `cd apps/macos && swift build` 已通过
-- `cd apps/macos && swift test` 已通过，38 个测试 0 失败
-- SPM 资源已纳入 `DesktopFootball` executable target
-- 已确认 `.process("Resources")` 会把资源打平到 bundle 根目录，因此加载逻辑不再依赖 `Resources/TriondaBall/0` 子目录
+## 已完成
+- **Shader 修 2D 贴图感** (`MetalScene.swift:1302-1330`)：normalMap 拉进漫反射项，加 `bumpWeight` 边缘渐变（silhouette 处归零），`clearCoat`/`broadHotspot` 收回，`rim`/`fresnel`/`hemi` 改回 macroN
+- **Idle 模式重命名 + 行为重做** (`FootballPanel.swift:5-17, 622-780`)：
+  - `exhibitionSpin` (Exhibition) → `verticalSpin` (Vertical Spin)，0.6 rad/s 稳态 Y 转盘
+  - `physicalRoll` (Field Breeze) → `globeRoll` (Globe Roll)，纯物理驱动 launch
+  - 默认改为 `verticalSpin`
+- **Hanging Charm 模式**（新）：
+  - 新建 `FootballPhysics/PendulumState.swift`（3D 弹簧+阻尼+绳约束+持续微风）
+  - `BallRenderEffects` 加 `overrideWorldPosition` + `ropeAnchor` 字段
+  - `MetalScene.draw` 接受 override 位置并画细绳（halo + core 双线）
+  - `FootballPanel` 加 `pendulum` 状态机 + nudge + 物理旁路 + 重力 fallback
+  - `mouseDown` 点中球时给 impulse（鼠标→球反方向 + 随机 Z）
+  - 重力切到 zero/balloon 时自动回退到 verticalSpin
 
-## 本轮已修复
-- 修复 `BallModel.swift` 的 Swift 编译错误：
-  - `MDLAsset` 改为 `asset.count` + `asset.object(at:)` 索引遍历
-  - 不再把 `float4x4` 直接赋给 `MDLMesh.transform`
-- USDZ 归一化改为渲染时 local transform：
-  - 按 mesh bounding box 计算中心和半径
-  - `MetalScene` 的 model matrix 追加 `ballLocalTransform`
-  - 避免依赖 ModelIO 是否会把 `MDLObject.transform` bake 进顶点数据
-- 修复 Bundle 资源路径：
-  - 先从 bundle 根目录查找
-  - 兼容保留 `TriondaBall` / `Resources/TriondaBall` 子目录的布局
-- 拆分球体与地面/阴影 vertex descriptor：
-  - 球体使用 tangent，stride 44
-  - ground/shadow 继续使用原始 position/normal/uv，stride 32
-  - shader 对应拆分为 `BallVertexIn` 和 `SurfaceVertexIn`
-- 修复 fallback 渲染风险：
-  - 程序化球也生成 tangent
-  - fragment shader 始终绑定 baseColor/normal/metallic/roughness 四张纹理
-  - 缺失 PBR 贴图时使用 1x1 默认 normal/metallic/roughness 贴图
-- 调亮 Trionda shader：
-  - 确认 metallic 平均约 5.6%，不是灰蒙蒙主因
-  - roughness 贴图是 1x1 纯白，原 PBR 环境光过低会让球偏灰
-  - 改成 key/fill/rim 展示光照，并限制 roughness/metallic 对颜色的压制
-  - 进一步按 chroma mask 提升有色区域饱和度到最高 2.05，白色面板只做轻微饱和，避免整球过曝
-  - 最终 lit color 再做轻微饱和增强，但整体亮度倍率从 `1.14` 收到 `1.12`
-- 强化弹跳形变：
-  - 3D shader 中 `u.squash` 视觉倍率提升到 1.35，最大 clamp 到 0.68
-  - squash 改为近似以底部接触点为锚点压缩，减少落地形变时球底漂浮的感觉
-- 根据实机截图继续校正：
-  - 可见球半径增加到物理半径的 1.18 倍，并用该半径重新贴地
-  - 阴影从原来的 `1.5x scale` 收到 `1.08x visualRadius`
-  - 阴影 alpha 从 `0.30` 降到 `0.22`
-  - baseColor 饱和度提升到 `1.45`，最终亮度倍率从 `1.08` 调到 `1.14`
-- 根据用户反馈进一步调整：
-  - `PhysicsConfig.standard.radius` 从 30pt 改到 71pt，让当前可见球约为截图版本的 2 倍，并让视觉、碰撞、边界对齐
-  - `MetalCamera` 改成按 viewport 校准投影：`z=0` 前玻璃平面投影后正好覆盖 drawable viewport
-  - 相机距离固定为 2200 world units，FOV 由 `frontHeight` 动态计算，保留微弱透视
-  - 视觉 Z 空间不再固定 `[-360, 360]`，改为随球大小动态设置，总深度约 3 个球直径
-  - `MetalScene` 的 screen -> world 映射改用 viewport 原点/宽高，visible bounds 只用于确定桌面 floor 位置
-- 底边统一避开 Dock 区域：
-  - `FootballPanel` 不再用 `NSScreen.visibleFrame` 决定底边
-  - 活动区域改为 `NSScreen.frame` 加固定 `dockClearance = 80pt` 的 bottom inset
-  - 不判断 Dock 是否存在、隐藏或位于哪个方向，各屏幕底边统一上抬同一距离
-- 清理冗余资源：
-  - 删除 `scene.usdz`（与主 USDZ sha256 完全相同）
-  - 删除 `scene.usdc`（已包含在主 USDZ 内）
-  - 保留 `fifa_trionda_ball_world_cup_2026.usdz` 和 4 张外部 PBR JPG
+## 待完成
+- 实机验证 Hanging Charm：3D 摆动幅度、Z 摆动产生的"近大远小"、绳索亮度
+- 实机验证默认 verticalSpin 转速是否合适（0.6 rad/s 约 10.5s/圈，museum 节奏）
+- （可选）shader 加 envMap IBL 反射，让金属感更接近 three.js 加载 glb 的效果
+
+## 关键决策
+- **bump 强度 0.55 而非 1.0**：保留手算 key/fill/rim 的"艺术化柔光"语义，避免过脏；如实机太弱可推到 0.7
+- **bumpWeight 用 macroFacing 而非 shadeN 驱动渐变**：silhouette 处 fadeOut 必须用光滑球面判断，否则自己掐自己
+- **globeRoll 不施加持续力，只在球停稳时给初速度**：纯物理驱动，更像地球仪；方向翻转 50/50 在 launch 之间切换
+- **PendulumState 独立于 BallState**：3D 摆动用独立的 `displacement` 状态，绕开 `BallState` 的 2D 物理；mode 切换时创建/丢弃
+- **Hanging Charm 物理旁路**：在 mode == .hangingCharm 时跳过 `ball.step()` / kick field / grab / snap，球的运动完全由 `pendulum.step(dt)` 驱动
+- **Nudge 用"鼠标远离球"反方向**：模拟"被弹了一下"的手感，不强制是鼠标移动方向
+
+## 踩坑记录
+- **`exhibitionSpinSpeed = 8.0` 注释写"°/s"但当 rad/s 用** → 1.27 圈/秒远快于"gentle turntable"，看起来"乱转"。`0.6` rad/s 才是 museum 节奏
+- **`0.15 * sin(0.35 * phase)` 每帧累加 X** → 9 rad/s 峰值 X 摆动，明显的"乱转"感。新实现完全去掉
+- **`physicalRoll` 用 `blend(velocity, target)` 持续拉** → 撞墙反弹被立刻拉回，方向从不真变。改成"球停稳时给初速度"才符合 globe roll 语义
+- **`shadeN = macroN` 导致 normalMap 仅影响高光** → 球身 95% 光照无 3D 感。把 normalMap 拉进 diffuse 后立刻立体
+- **bumpN 在 silhouette 处有 halo** → 因为 `dot(macroN, V) ≈ 0`，bump 把法线推到指向观察者，`fresnel`/`rim` 爆掉。加 `bumpWeight` 边缘 fadeOut
+- **`shadeN` 算 `hemi` 导致整体变暗** → bump 扰动后 `shadeN.y` 偏小，环境光下移。`hemi` 改回 `macroN.y` 即可
+- **`NSPanel` 没有 `window` 属性**（NSWindow.window 是 self，NSView.window 是父窗口）→ NSPanel 自己就是 window，直接用 `frame`
+- **`MetalScene.tankPointsToWorld` 是 private** → 在 FootballPanel 端做反向投影时手写公式（hardcode tankHeight=620，跟 MetalScene 内部保持一致）
+- **`Bounds` 是屏幕坐标，anchor 要用世界坐标** → 修 `bounds.upperY` 不存在时改用 `620 + 90`（Y=620 是 tank 顶，加 90pt 让锚点在视野外）
+
+## 下一步
+1. **实机跑 Hanging Charm**（最优先）：
+   - 菜单 Idle Motion → Hanging Charm
+   - 球应从顶部垂下，3D 摆动，**近大远小**应肉眼可见
+   - 点击球 → 大幅摆动
+   - 切 Zero Gravity → 自动回 Vertical Spin
+2. **如果不满意**调参参考（参数都在文件头注释里）：
+   - 摆动太死 → 调高 `PendulumState.windStrength`（默认 1.1）
+   - Z 变化太弱 → 调高 `windStrength` 或减小 `dampingPerSecond`（默认 0.78）
+   - 绳太亮/太暗 → 改 `MetalScene.drawRope` 里 `core`/`halo` alpha
+   - 启动时球位置不对 → 改 `FootballPanel.hangingCharmRopeLength` / anchor Y
+3. **可选 follow-up**：shader 加程序化 envMap (IBL) → 接近 three.js glb 效果
 
 ## 关键文件
-- `apps/macos/Package.swift`
-- `apps/macos/Sources/DesktopFootball/BallModel.swift`
-- `apps/macos/Sources/DesktopFootball/FootballPanel.swift`
-- `apps/macos/Sources/DesktopFootball/MetalCamera.swift`
-- `apps/macos/Sources/DesktopFootball/MetalScene.swift`
-- `apps/macos/Sources/FootballPhysics/Bounds.swift`
-- `apps/macos/Sources/FootballPhysics/PhysicsConfig.swift`
-- `apps/macos/Sources/DesktopFootball/Resources/TriondaBall/`
+- `apps/macos/Sources/FootballPhysics/PendulumState.swift` — 3D 阻尼摆，Hanging Charm 的物理核心
+- `apps/macos/Sources/DesktopFootball/FootballPanel.swift` — idle 模式状态机 + pendulum 驱动 + mouseDown nudge + 重力 fallback
+- `apps/macos/Sources/DesktopFootball/MetalScene.swift` — `ballFragment` bump 修复 + `drawRope` + override 位置支持
+- `apps/macos/Sources/DesktopFootball/FootballMetalView.swift` — `BallRenderEffects` 加 `overrideWorldPosition` / `ropeAnchor` 字段
 
 ## 验证记录
 ```bash
@@ -74,9 +73,11 @@ cd apps/macos && swift build
 # Build complete
 
 cd apps/macos && swift test
-# Executed 38 tests, with 0 failures
+# Executed 43 tests, with 0 failures
 ```
 
 ## 仍建议人工确认
-- 重新运行 app，观察调亮/放大/viewport 校准后的 Trionda 外观是否过曝、过大或仍偏灰，并确认落地点离屏幕底边约 80pt。
-- 如果视觉仍不理想，下一步优先微调 `FootballPanel.dockClearance`、`PhysicsConfig.standard.radius`、`MetalCamera.distance`、`MetalScene.swift` 中的 `shadowScale`、baseColor saturation 和 `color * 1.12`。
+- 实机看 Hanging Charm 的 Z 摆动是否够"大"（建议近大远小差异 ≥ 10%）
+- verticalSpin 稳态转速是否够"稳"（无 X/Y 抖动）
+- globeRoll 撞墙反弹是否符合直觉（restitution 0.74 是底层值）
+- Trionda 球的 3D 凹凸是否到位（无边缘 halo，无整体变暗）

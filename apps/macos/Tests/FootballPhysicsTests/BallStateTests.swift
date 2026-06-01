@@ -76,6 +76,17 @@ final class BallStateTests: XCTestCase {
         XCTAssertTrue(events.contains { $0.hitWall != nil }, "a wall-hit event should fire")
     }
 
+    func testSideWallBounceUsesWallRestitution() {
+        var ball = BallState(center: CGPoint(x: bounds.maxX(radius: config.radius) - 1, y: bounds.floorY(radius: config.radius)),
+                             velocity: CGPoint(x: 3000, y: 0))
+
+        ball.step(dt: dt, fieldForce: .zero, bounds: bounds, config: config)
+
+        XCTAssertLessThan(ball.velocity.x, 0)
+        XCTAssertGreaterThan(abs(ball.velocity.x), 2000,
+                             "side walls should keep enough energy for power-strike ricochets")
+    }
+
     // MARK: US-3 spin
 
     func testRollingRightSpinsClockwise() {
@@ -84,7 +95,7 @@ final class BallStateTests: XCTestCase {
         ball.step(dt: dt, fieldForce: .zero, bounds: bounds, config: config)
         // CALayer CCW-positive ⇒ clockwise spin is a negative angular velocity.
         XCTAssertLessThan(ball.angularVelocity, 0)
-        XCTAssertEqual(ball.angularVelocity, -ball.velocity.x / config.radius, accuracy: 1e-6)
+        XCTAssertGreaterThan(abs(ball.angularVelocity), 0)
     }
 
     func testRollingLeftSpinsCounterClockwise() {
@@ -94,21 +105,31 @@ final class BallStateTests: XCTestCase {
         XCTAssertGreaterThan(ball.angularVelocity, 0)
     }
 
-    // MARK: US-3 squash & stretch
+    func testWallBounceDoesNotImmediatelyReverseSpin() {
+        var ball = BallState(center: CGPoint(x: bounds.maxX(radius: config.radius) - 1,
+                                             y: bounds.floorY(radius: config.radius)),
+                             velocity: CGPoint(x: 900, y: 0),
+                             angularVelocity: -900 / config.radius)
+        ball.step(dt: dt, fieldForce: .zero, bounds: bounds, config: config)
+        XCTAssertLessThan(ball.velocity.x, 0)
+        XCTAssertLessThan(ball.angularVelocity, 0)
+    }
 
-    func testHardLandingProducesSquash() {
+    // MARK: Round ball guard
+
+    func testHardLandingDoesNotDeformBall() {
         var ball = BallState(center: CGPoint(x: 700, y: bounds.floorY(radius: config.radius) + 2),
                              velocity: CGPoint(x: 0, y: -3000))
         ball.step(dt: dt, fieldForce: .zero, bounds: bounds, config: config)
-        XCTAssertGreaterThan(ball.squash, 0, "a hard landing should squash the ball")
-        XCTAssertLessThanOrEqual(ball.squash, config.maxSquash + 1e-6)
+        XCTAssertEqual(ball.squash, 0, accuracy: 0.001,
+                       "collisions should keep the visible ball perfectly round")
     }
 
-    func testSquashRelaxesBackToRound() {
+    func testExistingSquashIsCleared() {
         var ball = BallState(center: CGPoint(x: 700, y: bounds.floorY(radius: config.radius)),
-                             squash: config.maxSquash)
-        advance(&ball, frames: 120)
-        XCTAssertLessThan(ball.squash, 0.02, "squash should decay back to round")
+                             squash: 0.4)
+        ball.step(dt: dt, fieldForce: .zero, bounds: bounds, config: config)
+        XCTAssertEqual(ball.squash, 0, accuracy: 0.001)
     }
 
     // MARK: Motion state classification

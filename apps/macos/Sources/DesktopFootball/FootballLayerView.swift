@@ -86,6 +86,7 @@ final class FootballLayerView: NSView {
     ///   - motionState: drives the idle breathing pulse.
     func render(angle: CGFloat, squash: CGFloat, liftFactor: CGFloat, motionState: MotionState,
                 chargeFraction: CGFloat = 0) {
+        let visualSquash: CGFloat = 0
         CATransaction.begin()
         CATransaction.setDisableActions(true)
 
@@ -104,16 +105,16 @@ final class FootballLayerView: NSView {
         // Subtle perspective: a little larger when flying up ("toward the viewer").
         let perspective = 1 + 0.05 * liftFactor
 
-        let sx = (1 + squash * 0.75) * perspective * breathe
-        let sy = (1 - squash) * perspective * breathe
+        let sx = (1 + visualSquash * 0.75) * perspective * breathe
+        let sy = (1 - visualSquash) * perspective * breathe
         ballContainer.transform = CATransform3DMakeScale(sx, sy, 1)
 
         // Shadow: sinks + shrinks + fades as the ball rises; widens as it squashes.
         let offset = -diameter * 0.42 - diameter * 0.62 * liftFactor
         let shadowScale = (1 - 0.45 * liftFactor)
         shadowLayer.transform = CATransform3DMakeScale(
-            shadowScale * (1 + squash * 0.5),
-            shadowScale * (1 - squash * 0.3), 1)
+            shadowScale * (1 + visualSquash * 0.5),
+            shadowScale * (1 - visualSquash * 0.3), 1)
         shadowLayer.position = CGPoint(x: ballAnchor.x, y: ballAnchor.y + offset)
         shadowLayer.opacity = Float(0.34 * (1 - 0.7 * liftFactor))
 

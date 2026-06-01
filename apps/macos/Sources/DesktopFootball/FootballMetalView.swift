@@ -15,6 +15,14 @@ struct GlassInteractionFeedback {
     var didStrike: Bool
 }
 
+struct BallRenderEffects {
+    var rotationX: CGFloat
+    var rotationY: CGFloat
+    var rotationZ: CGFloat
+
+    static let neutral = BallRenderEffects(rotationX: 0, rotationY: 0, rotationZ: 0)
+}
+
 /// A plain `NSView` backed by a `CAMetalLayer` that owns the Metal rendering
 /// pipeline. Driven once per CVDisplayLink tick by `FootballPanel`.
 ///
@@ -29,6 +37,7 @@ final class FootballMetalView: NSView {
     private let strikeRingLayer = CAShapeLayer()
     private let hitRingLayer = CAShapeLayer()
     private let cursorLineLayer = CAShapeLayer()
+    private let fpsLayer = CATextLayer()
 
     init(frame: NSRect, scene: MetalScene) {
         self.scene = scene
@@ -49,6 +58,8 @@ final class FootballMetalView: NSView {
         layer?.addSublayer(strikeRingLayer)
         layer?.addSublayer(hitRingLayer)
         layer?.addSublayer(cursorLineLayer)
+        configureFPSLayer()
+        layer?.addSublayer(fpsLayer)
         layer?.masksToBounds = false
         updateRenderTargets()
     }
@@ -57,6 +68,10 @@ final class FootballMetalView: NSView {
 
     override var isFlipped: Bool { false }
     override var mouseDownCanMoveWindow: Bool { false }
+
+    func setBallModel(_ kind: BallModelKind) {
+        scene.setBallModel(kind)
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -90,15 +105,21 @@ final class FootballMetalView: NSView {
     func render(ballState: BallState,
                 config: PhysicsConfig,
                 bounds: Bounds,
-                interaction: GlassInteractionFeedback) {
+                interaction: GlassInteractionFeedback,
+                renderEffects: BallRenderEffects,
+                fps: Double?,
+                showsGuideLines: Bool) {
         updateRenderTargets()
-        updateGlassOverlay(interaction)
+        updateGlassOverlay(interaction, showsGuideLines: showsGuideLines)
+        updateFPSOverlay(fps)
         guard let depthTexture,
               let drawable = metalLayer.nextDrawable() else { return }
         let viewport = window?.frame ?? NSRect(origin: .zero, size: self.bounds.size)
         scene.draw(in: drawable, depthTexture: depthTexture,
                    ballState: ballState, config: config, bounds: bounds,
-                   viewport: viewport)
+                   viewport: viewport,
+                   renderEffects: renderEffects,
+                   showsGuideLines: showsGuideLines)
     }
 
     private func configureGlassOverlayLayers() {
@@ -117,7 +138,38 @@ final class FootballMetalView: NSView {
         cursorLineLayer.isHidden = true
     }
 
-    private func updateGlassOverlay(_ feedback: GlassInteractionFeedback) {
+    private func configureFPSLayer() {
+        fpsLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        fpsLayer.fontSize = 12
+        fpsLayer.alignmentMode = .left
+        fpsLayer.backgroundColor = NSColor.black.withAlphaComponent(0.52).cgColor
+        fpsLayer.cornerRadius = 4
+        fpsLayer.masksToBounds = true
+        fpsLayer.isHidden = true
+    }
+
+    private func updateFPSOverlay(_ fps: Double?) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
+        fpsLayer.frame = CGRect(x: 12, y: max(12, bounds.height - 32), width: 82, height: 20)
+        guard let fps else {
+            fpsLayer.isHidden = true
+            return
+        }
+
+        let color: NSColor
+        if fps >= 58 { color = .systemGreen }
+        else if fps >= 45 { color = .systemYellow }
+        else { color = .systemRed }
+        fpsLayer.foregroundColor = color.cgColor
+        fpsLayer.string = String(format: " FPS %.0f", fps)
+        fpsLayer.isHidden = false
+    }
+
+    private func updateGlassOverlay(_ feedback: GlassInteractionFeedback,
+                                    showsGuideLines: Bool) {
         let shouldShow = feedback.isNear || feedback.isGrabbed || feedback.isSnapped || feedback.didStrike
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -127,7 +179,7 @@ final class FootballMetalView: NSView {
         hitRingLayer.frame = bounds
         cursorLineLayer.frame = bounds
 
-        guard shouldShow, let window else {
+        guard showsGuideLines, shouldShow, let window else {
             strikeRingLayer.isHidden = true
             hitRingLayer.isHidden = true
             cursorLineLayer.isHidden = true

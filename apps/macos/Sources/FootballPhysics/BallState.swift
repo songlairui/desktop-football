@@ -3,12 +3,13 @@ import CoreGraphics
 /// The complete physical state of the ball plus the integrator that advances it.
 ///
 /// Coordinates are **ball centres** in screen space (+Y up). The renderer turns
-/// `angle` / `squash` / `velocity` into a CALayer transform; the window's origin
-/// is simply `center - windowSize/2`.
+/// `angle` / `squash` / `velocity` into the visible ball transform.
 ///
 /// Rotation convention matches Core Animation's layer space (counter-clockwise
 /// positive). A ball rolling to the right (`velocity.x > 0`) spins **clockwise**,
-/// i.e. `angularVelocity = -velocity.x / radius`, which decreases `angle`.
+/// i.e. `angularVelocity = -velocity.x / radius`, which decreases `angle`. The
+/// current 3D renderer maps this legacy screen-space spin onto the camera-facing
+/// Z axis; future true-depth modes should use a dedicated 3D orientation state.
 public struct BallState: Equatable, Sendable {
 
     /// Ball centre in screen coordinates.
@@ -101,8 +102,7 @@ public struct BallState: Equatable, Sendable {
         guard dt > 0 else { return .none }
         var events = PhysicsEvents.none
 
-        // Last frame's squash relaxes toward round; a fresh impact below overrides.
-        squash *= pow(config.squashRecovery60, dt * 60.0)
+        squash = 0
 
         let restingAtStart = isResting(config: config, bounds: bounds)
 
@@ -135,8 +135,10 @@ public struct BallState: Equatable, Sendable {
             velocity = .zero
         }
 
-        // 6. Spin tracks horizontal speed (pure-rolling assumption).
-        updateSpin(dt: dt, config: config)
+        // 6. Spin is coupled to horizontal speed by surface friction. In the air,
+        // or immediately after a bounce, existing spin carries through instead of
+        // snapping to the new travel direction.
+        updateSpin(dt: dt, config: config, bounds: bounds)
 
         return events
     }
@@ -156,7 +158,7 @@ public struct BallState: Equatable, Sendable {
             clampSpeed(to: config.maxSpeed)
         }
         center = clamped
-        squash *= pow(config.squashRecovery60, dt * 60.0)
+        squash = 0
         updateSpin(dt: dt, config: config)
     }
 
@@ -195,7 +197,7 @@ public struct BallState: Equatable, Sendable {
         center.y += velocity.y * dt
         center = bounds.clampCenter(center, radius: config.radius)
 
-        squash *= pow(config.squashRecovery60, dt * 60.0)
+        squash = 0
         updateSpin(dt: dt, config: config)
 
         if hypot(target.x - center.x, target.y - center.y) > config.snapBreakDistance {
@@ -212,8 +214,18 @@ public struct BallState: Equatable, Sendable {
 
     // MARK: - Helpers
 
-    private mutating func updateSpin(dt: CGFloat, config: PhysicsConfig) {
-        angularVelocity = -velocity.x / max(config.radius, 1)
+    private mutating func updateSpin(dt: CGFloat, config: PhysicsConfig, bounds: Bounds? = nil) {
+        let rollingTarget = -velocity.x / max(config.radius, 1)
+        if let bounds {
+            if isResting(config: config, bounds: bounds) {
+                let grip = 1 - pow(0.72, dt * 60.0)
+                angularVelocity += (rollingTarget - angularVelocity) * grip
+            } else {
+                angularVelocity *= pow(0.992, dt * 60.0)
+            }
+        } else {
+            angularVelocity = rollingTarget
+        }
         angle += angularVelocity * dt
     }
 
@@ -235,8 +247,8 @@ public struct BallState: Equatable, Sendable {
         let minX = bounds.minX(radius: config.radius)
         let maxX = bounds.maxX(radius: config.radius)
 
-        // The surface gravity pulls the ball onto is the "landing" surface (full
-        // landing squash + sound); the opposite is just a wall bounce. Under
+        // The surface gravity pulls the ball onto is the "landing" surface
+        // for sound/events; the opposite is just a wall bounce. Under
         // normal/zero gravity that's the floor; in balloon mode it's the ceiling.
         let floorIsLanding = config.gravityY <= 0
 
@@ -245,9 +257,7 @@ public struct BallState: Equatable, Sendable {
             let impact = abs(velocity.y)
             center.y = floorY
             if impact > config.bounceCutoff {
-                velocity.y = impact * config.restitution
-                let amount = config.maxSquash * min(1, impact / config.squashReference)
-                squash = max(squash, amount)
+                velocity.y = impact * (floorIsLanding ? config.restitution : config.wallRestitution)
                 if floorIsLanding { events.landed = max(events.landed ?? 0, impact) }
                 else { events.hitWall = max(events.hitWall ?? 0, impact) }
             } else {
@@ -256,15 +266,13 @@ public struct BallState: Equatable, Sendable {
         }
 
         // Ceiling — mirrors the floor so balloon mode can settle against the top
-        // instead of jittering: a soft touch is cancelled, a hard one bounces and
-        // squashes. In balloon mode this is the landing surface.
+        // instead of jittering: a soft touch is cancelled, a hard one bounces.
+        // In balloon mode this is the landing surface.
         if center.y > ceilY {
             let impact = abs(velocity.y)
             center.y = ceilY
             if impact > config.bounceCutoff {
-                velocity.y = -impact * config.restitution
-                let amount = config.maxSquash * min(1, impact / config.squashReference)
-                squash = max(squash, amount)
+                velocity.y = -impact * (floorIsLanding ? config.wallRestitution : config.restitution)
                 if floorIsLanding { events.hitWall = max(events.hitWall ?? 0, impact) }
                 else { events.landed = max(events.landed ?? 0, impact) }
             } else {
@@ -276,13 +284,13 @@ public struct BallState: Equatable, Sendable {
         if center.x < minX {
             let impact = abs(velocity.x)
             center.x = minX
-            velocity.x = impact * config.restitution
+            velocity.x = impact * config.wallRestitution
             if impact > config.bounceCutoff { events.hitWall = max(events.hitWall ?? 0, impact) }
         }
         if center.x > maxX {
             let impact = abs(velocity.x)
             center.x = maxX
-            velocity.x = -impact * config.restitution
+            velocity.x = -impact * config.wallRestitution
             if impact > config.bounceCutoff { events.hitWall = max(events.hitWall ?? 0, impact) }
         }
     }

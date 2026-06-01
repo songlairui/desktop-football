@@ -47,6 +47,11 @@ public struct PhysicsConfig: Equatable, Sendable {
     /// Fraction of normal-velocity kept after a wall/ground bounce (0…1).
     public var restitution: CGFloat
 
+    /// Fraction of normal-velocity kept after hitting a non-resting wall. Kept
+    /// higher than floor restitution so power strikes can ricochet around the
+    /// screen without making ordinary landings overly bouncy.
+    public var wallRestitution: CGFloat
+
     /// Below this speed at surface contact the bounce is cancelled and the ball is
     /// considered resting (prevents infinite micro-bounces on floor or ceiling).
     public var bounceCutoff: CGFloat
@@ -117,14 +122,15 @@ public struct PhysicsConfig: Equatable, Sendable {
     public var squashRecovery60: CGFloat
 
     public init(
-        radius: CGFloat = 30,
+        radius: CGFloat = 71,
         gravityY: CGFloat = PhysicsConfig.normalGravity,
         airDamping60: CGFloat = 0.999,
         rollingResistance60: CGFloat = 0.95,
         restitution: CGFloat = 0.58,
+        wallRestitution: CGFloat = 0.74,
         bounceCutoff: CGFloat = 90,
         sleepSpeed: CGFloat = 14,
-        maxSpeed: CGFloat = 6000,
+        maxSpeed: CGFloat = 11_000,
         kickRadius: CGFloat = PhysicsConfig.normalKickRadius,
         kickGain: CGFloat = PhysicsConfig.normalKickGain,
         hoverForce: CGFloat = 220,
@@ -135,15 +141,16 @@ public struct PhysicsConfig: Equatable, Sendable {
         snapCursorOffset: CGFloat = 42,
         snapBreakDistance: CGFloat = 85,
         snapCaptureDistance: CGFloat = 55,
-        maxSquash: CGFloat = 0.55,
-        squashReference: CGFloat = 1700,
-        squashRecovery60: CGFloat = 0.82
+        maxSquash: CGFloat = 0,
+        squashReference: CGFloat = 2400,
+        squashRecovery60: CGFloat = 0.74
     ) {
         self.radius = radius
         self.gravityY = gravityY
         self.airDamping60 = airDamping60
         self.rollingResistance60 = rollingResistance60
         self.restitution = restitution
+        self.wallRestitution = wallRestitution
         self.bounceCutoff = bounceCutoff
         self.sleepSpeed = sleepSpeed
         self.maxSpeed = maxSpeed

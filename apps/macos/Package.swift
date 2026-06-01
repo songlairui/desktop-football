@@ -19,6 +19,7 @@ let package = Package(
             name: "DesktopFootball",
             dependencies: ["FootballPhysics"],
             path: "Sources/DesktopFootball",
+            resources: [.process("Resources")],
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
                 .linkedFramework("MetalKit"),

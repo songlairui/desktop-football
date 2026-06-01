@@ -21,6 +21,53 @@ final class GlassContactTests: XCTestCase {
         XCTAssertEqual(result.impulse.y, 0, accuracy: 0.001)
     }
 
+    func testFastSwipeProducesStrongStrikeImpulse() {
+        let result = GlassContact.evaluate(
+            ballCenter: CGPoint(x: 500, y: 500),
+            previousMouse: CGPoint(x: 420, y: 500),
+            mouse: CGPoint(x: 580, y: 500),
+            mouseVelocity: CGPoint(x: 2_400, y: 0),
+            strikeRadius: 50,
+            minimumSpeed: 600,
+            wasInside: false,
+            cooldownReady: true
+        )
+
+        XCTAssertGreaterThan(hypot(result.impulse.x, result.impulse.y), 3_000)
+    }
+
+    func testVeryFastSwipeProducesPowerStrikeImpulse() {
+        let result = GlassContact.evaluate(
+            ballCenter: CGPoint(x: 500, y: 500),
+            previousMouse: CGPoint(x: 420, y: 500),
+            mouse: CGPoint(x: 580, y: 500),
+            mouseVelocity: CGPoint(x: 4_200, y: 0),
+            strikeRadius: 50,
+            minimumSpeed: 600,
+            wasInside: false,
+            cooldownReady: true
+        )
+
+        XCTAssertGreaterThan(hypot(result.impulse.x, result.impulse.y), 7_500)
+    }
+
+    func testStrikeReportsProjectedContactOffset() {
+        let result = GlassContact.evaluate(
+            ballCenter: CGPoint(x: 500, y: 500),
+            previousMouse: CGPoint(x: 420, y: 530),
+            mouse: CGPoint(x: 580, y: 530),
+            mouseVelocity: CGPoint(x: 2_400, y: 0),
+            strikeRadius: 50,
+            minimumSpeed: 600,
+            wasInside: false,
+            cooldownReady: true
+        )
+
+        XCTAssertTrue(result.didStrike)
+        XCTAssertEqual(result.contactOffset.x, 0, accuracy: 0.001)
+        XCTAssertEqual(result.contactOffset.y, 30, accuracy: 0.001)
+    }
+
     func testSlowSwipeDoesNotStrike() {
         let result = GlassContact.evaluate(
             ballCenter: CGPoint(x: 500, y: 500),

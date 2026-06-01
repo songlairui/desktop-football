@@ -2,6 +2,23 @@ import AppKit
 import CoreVideo
 import FootballPhysics
 
+enum IdleMotionMode: Int, CaseIterable {
+    case fingerSpin
+    case physicalRoll
+
+    var menuTitle: String {
+        switch self {
+        case .fingerSpin: return "Finger Spin"
+        case .physicalRoll: return "Field Breeze"
+        }
+    }
+}
+
+private enum FingerSpinPhase {
+    case charging
+    case coasting
+}
+
 /// The desktop football window. A full-screen transparent panel hosts the Metal
 /// scene while the physics engine still tracks the ball in screen coordinates.
 ///
@@ -15,6 +32,8 @@ import FootballPhysics
 final class FootballPanel: NSPanel {
 
     // MARK: Geometry
+    private static let dockClearance: CGFloat = 80
+
     /// The screen-sized frame currently occupied by the transparent Metal overlay.
     private var overlayFrame: NSRect
 
@@ -35,6 +54,30 @@ final class FootballPanel: NSPanel {
     private var lastKickAt: CFTimeInterval = 0
     private var wasInGlassStrikeDisk = false
 
+    // MARK: 3D render feel
+    private var visualRotationX: CGFloat = 0
+    private var visualRotationY: CGFloat = 0
+    private var visualRotationZ: CGFloat = 0
+    private var visualSpinVelocityX: CGFloat = 0
+    private var visualSpinVelocityY: CGFloat = 0
+    private var visualSpinVelocityZ: CGFloat = 0
+    private var idleSpinPhase: CGFloat = 0
+    private var fingerSpinDirection: CGFloat = 1
+    private var fingerSpinPhaseState: FingerSpinPhase = .charging
+    private var fingerSpinTimer: CGFloat = 0
+    private var fingerSpinDuration: CGFloat = 0.11
+    private var fingerSpinPeakSpeed: CGFloat = 25.0
+    private var fingerSpinBaseSpeed: CGFloat = 1.2
+    private var fingerSpinBurstIndex = 0
+    private var fingerSpinBurstCount = 5
+    private var fingerSpinCurrentSpeed: CGFloat = 1.2
+    private var physicalRollCountdown: CGFloat = 3.0
+    private var physicalRollDirection: CGFloat = 1
+    private var physicalRollTargetSpeed: CGFloat = 90
+    private var fpsSampleStart: CFTimeInterval = 0
+    private var fpsSampleFrames = 0
+    private(set) var measuredFPS: Double = 0
+
     // MARK: Interaction state
     private var didDrag = false
     private var grabOffset = CGPoint.zero
@@ -46,6 +89,10 @@ final class FootballPanel: NSPanel {
 
     // MARK: Game mode
     private(set) var isGameMode = false
+    private(set) var showsGuideLines = false
+    private(set) var showsFPS = false
+    private(set) var idleMotionMode: IdleMotionMode = .fingerSpin
+    private(set) var ballModelKind: BallModelKind = .fifa2026
     private var cursorRingPanel: CursorRingPanel?
     var comboStrikeCount = 2    // 0=off, 2, or 3 — set from menu
     private var chargeFraction: CGFloat = 0
@@ -76,9 +123,8 @@ final class FootballPanel: NSPanel {
             ?? NSScreen.main
             ?? NSScreen.screens.first
         let initialFrame = screen?.frame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-        let vis = screen?.visibleFrame ?? initialFrame
-        bounds = Bounds(rect: vis)
-        ball = BallState.resting(atX: vis.midX, bounds: bounds, config: config)
+        bounds = screen.map(Self.playArea) ?? Bounds(rect: initialFrame.insetByBottom(Self.dockClearance))
+        ball = BallState.resting(atX: bounds.rect.midX, bounds: bounds, config: config)
         overlayFrame = initialFrame
 
         guard let scene = MetalScene() else { fatalError("Metal not available") }
@@ -117,6 +163,7 @@ final class FootballPanel: NSPanel {
         bounds = screenBounds(containing: ball.center)
         ball = BallState.resting(atX: bounds.rect.midX, bounds: bounds, config: config)
         wasInGlassStrikeDisk = false
+        resetVisual3D()
         syncWindowToBall()
     }
 
@@ -126,15 +173,49 @@ final class FootballPanel: NSPanel {
         isGameMode = on
         config.kickRadius = on ? 160 : PhysicsConfig.normalKickRadius
         config.kickGain   = on ? 165 : PhysicsConfig.normalKickGain
-        if on {
+        syncCursorRingPanel()
+        if !on {
+            chargeFraction = 0
+            chargeStartTime = nil
+        }
+    }
+
+    func setGuideLines(_ on: Bool) {
+        showsGuideLines = on
+        syncCursorRingPanel()
+        syncWindowToBall()
+    }
+
+    func setFPSVisible(_ on: Bool) {
+        showsFPS = on
+        measuredFPS = 0
+        fpsSampleStart = 0
+        fpsSampleFrames = 0
+        syncWindowToBall()
+    }
+
+    func setIdleMotionMode(_ mode: IdleMotionMode) {
+        idleMotionMode = mode
+        resetIdleMotionTimers()
+        resetVisual3D()
+        syncWindowToBall()
+    }
+
+    func setBallModel(_ kind: BallModelKind) {
+        ballModelKind = kind
+        ballView.setBallModel(kind)
+        syncWindowToBall()
+    }
+
+    private func syncCursorRingPanel() {
+        if isGameMode && showsGuideLines {
+            if cursorRingPanel != nil { return }
             let ring = CursorRingPanel(kickRadius: config.kickRadius)
             ring.orderFrontRegardless()
             cursorRingPanel = ring
         } else {
             cursorRingPanel?.orderOut(nil)
             cursorRingPanel = nil
-            chargeFraction = 0
-            chargeStartTime = nil
         }
     }
 
@@ -173,6 +254,9 @@ final class FootballPanel: NSPanel {
         ball.velocity.y += sin(angle) * gustStrength
         let spd = hypot(ball.velocity.x, ball.velocity.y)
         if spd > config.maxSpeed { ball.velocity.x *= config.maxSpeed / spd; ball.velocity.y *= config.maxSpeed / spd }
+        applyOffAxisStrike(impulse: CGPoint(x: cos(angle) * gustStrength,
+                                            y: sin(angle) * gustStrength),
+                           strength: 0.35)
         EffectsOverlayPanel.shared.showStrikeEffect(at: ball.center, power: 0.35)
         sound.playKick(strength: gustStrength * 0.25)
     }
@@ -232,6 +316,7 @@ final class FootballPanel: NSPanel {
         let now = CACurrentMediaTime()
         let dt: CGFloat = lastStepTime == 0 ? 1.0 / 60.0 : CGFloat(now - lastStepTime)
         lastStepTime = now
+        updateFPS(now: now)
         tick(dt: min(dt, 0.1), now: now)
     }
 
@@ -247,6 +332,7 @@ final class FootballPanel: NSPanel {
         let mVel = CGPoint(x: (mouse.x - previousMouse.x) / dt, y: (mouse.y - previousMouse.y) / dt)
         prevMouse = mouse
         var didGlassStrike = false
+        var motionState: MotionState = .idle
 
         // ── Snap (Right Option) ──────────────────────────────────────────────────
         let snapHeld = isRightOptionDown()
@@ -278,12 +364,14 @@ final class FootballPanel: NSPanel {
             ball.follow(target: CGPoint(x: mouse.x + grabOffset.x, y: mouse.y + grabOffset.y),
                         dt: dt, bounds: bounds, config: config)
             sound.setRollSpeed(0)
+            motionState = .grabbed
         } else if doSnap {
             if !ball.isSnapped {
                 ball.center = snapPoint; ball.velocity = .zero; ball.isSnapped = true
             }
             ball.snapStep(target: snapPoint, dt: dt, bounds: bounds, config: config)
             sound.setRollSpeed(0)
+            motionState = .grabbed
         } else {
             ball.isSnapped = false
             // During charge: suppress the dynamic kick so the player can aim without
@@ -308,10 +396,13 @@ final class FootballPanel: NSPanel {
 
             let events = ball.step(dt: dt, fieldForce: .zero, bounds: bounds, config: config)
 
-            if let impact = events.landed { sound.playBounce(impact: impact) }
+            if let impact = events.landed {
+                sound.playBounce(impact: impact)
+            }
             if let impact = events.hitWall { sound.playBounce(impact: impact * 0.6) }
 
             let state = ball.motionState(config: config, bounds: bounds)
+            motionState = state
             sound.setRollSpeed(state == .rolling ? abs(ball.velocity.x) : 0)
 
             // ── Combo detection (only when free-rolling, not grabbing/snapping) ──
@@ -324,6 +415,7 @@ final class FootballPanel: NSPanel {
             ring.update(mouse: mouse, inRange: d < config.kickRadius, chargeFraction: chargeFraction)
         }
 
+        updateVisual3D(dt: dt, motionState: motionState)
         updateInteractivity(mouse: mouse)
         wasInGlassStrikeDisk = distanceFromBall(mouse) <= glassStrikeRadius
         syncWindowToBall(mouse: mouse, didStrike: didGlassStrike)
@@ -393,7 +485,10 @@ final class FootballPanel: NSPanel {
         ballView.render(ballState: ball,
                         config: config,
                         bounds: bounds,
-                        interaction: interactionFeedback(mouse: mouse, didStrike: didStrike))
+                        interaction: interactionFeedback(mouse: mouse, didStrike: didStrike),
+                        renderEffects: currentRenderEffects,
+                        fps: showsFPS ? measuredFPS : nil,
+                        showsGuideLines: showsGuideLines)
     }
 
     private func syncOverlayFrameToBall() {
@@ -470,8 +565,10 @@ final class FootballPanel: NSPanel {
            abs(strike.impulse.y) < abs(strike.impulse.x) * 0.35 {
             ball.velocity.y += 160 + 180 * strike.strength
         }
-        capBallSpeed(to: config.maxSpeed * 1.08)
-        ball.squash = min(config.maxSquash, ball.squash + 0.12 + 0.18 * strike.strength)
+        capBallSpeed(to: config.maxSpeed * 1.18)
+        applyOffAxisStrike(impulse: strike.impulse,
+                           strength: strike.strength,
+                           contactOffset: strike.contactOffset)
 
         let angle = atan2(strike.impulse.y, strike.impulse.x)
         let power = 0.35 + strike.strength * 0.65
@@ -489,23 +586,248 @@ final class FootballPanel: NSPanel {
         ball.velocity.y *= k
     }
 
-    /// The union of every screen's visible frame — used only while the ball is
+    private var currentRenderEffects: BallRenderEffects {
+        BallRenderEffects(rotationX: visualRotationX,
+                          rotationY: visualRotationY,
+                          rotationZ: visualRotationZ)
+    }
+
+    private func resetVisual3D() {
+        visualRotationX = 0
+        visualRotationY = 0
+        visualRotationZ = 0
+        visualSpinVelocityX = 0
+        visualSpinVelocityY = 0
+        visualSpinVelocityZ = 0
+        resetIdleMotionTimers()
+    }
+
+    private func resetIdleMotionTimers() {
+        fingerSpinDirection = 1
+        fingerSpinPhaseState = .charging
+        fingerSpinTimer = 0
+        fingerSpinDuration = CGFloat.random(in: 0.09...0.13)
+        fingerSpinPeakSpeed = CGFloat.random(in: 22.0...30.0)
+        fingerSpinBaseSpeed = CGFloat.random(in: 1.0...1.45)
+        fingerSpinBurstIndex = 0
+        fingerSpinBurstCount = Int.random(in: 3...7)
+        fingerSpinCurrentSpeed = fingerSpinBaseSpeed
+        physicalRollDirection = Bool.random() ? 1 : -1
+        physicalRollTargetSpeed = CGFloat.random(in: 70...140) * physicalRollDirection
+        physicalRollCountdown = CGFloat.random(in: 4.0...8.0)
+    }
+
+    private func updateVisual3D(dt: CGFloat, motionState: MotionState) {
+        guard dt > 0 else { return }
+        switch idleMotionMode {
+        case .fingerSpin:
+            if motionState == .idle {
+                updateFingerSpinIdle(dt: dt)
+            } else {
+                let damping60: CGFloat = motionState == .grabbed ? 0.90 : 0.994
+                decayExtraSpin(dt: dt, damping60: damping60)
+            }
+        case .physicalRoll:
+            if isFieldBreezeEligible(motionState: motionState) {
+                updateFieldBreezeIdle(dt: dt, motionState: motionState)
+            } else {
+                decayExtraSpin(dt: dt, damping60: 0.90)
+            }
+        }
+
+        visualRotationX += visualSpinVelocityX * dt
+        visualRotationY += visualSpinVelocityY * dt
+        visualRotationZ += visualSpinVelocityZ * dt
+    }
+
+    private func updateFingerSpinIdle(dt: CGFloat) {
+        idleSpinPhase += dt
+        fingerSpinTimer += dt
+
+        let targetY: CGFloat
+        switch fingerSpinPhaseState {
+        case .charging:
+            let t = min(1, fingerSpinTimer / max(fingerSpinDuration, 0.001))
+            let burstProgress = CGFloat(fingerSpinBurstIndex + 1) / CGFloat(max(fingerSpinBurstCount, 1))
+            let burstPeak = lerp(fingerSpinBaseSpeed + 5.0,
+                                 fingerSpinPeakSpeed,
+                                 smoothStep(burstProgress))
+            let startSpeed = fingerSpinCurrentSpeed
+            targetY = fingerSpinDirection * lerp(startSpeed, burstPeak, easeOutCubic(t))
+            if t >= 1 {
+                fingerSpinCurrentSpeed = max(fingerSpinCurrentSpeed, burstPeak)
+                fingerSpinPhaseState = .coasting
+                fingerSpinTimer = 0
+                fingerSpinDuration = fingerSpinBurstIndex >= fingerSpinBurstCount - 1
+                    ? CGFloat.random(in: 1.45...2.05)
+                    : CGFloat.random(in: 0.08...0.16)
+            }
+
+        case .coasting:
+            let t = min(1, fingerSpinTimer / max(fingerSpinDuration, 0.001))
+            let coastSpeed = fingerSpinBurstIndex >= fingerSpinBurstCount - 1
+                ? fingerSpinBaseSpeed
+                : fingerSpinCurrentSpeed
+            targetY = fingerSpinDirection * lerp(fingerSpinCurrentSpeed,
+                                                 coastSpeed,
+                                                 smoothStep(t))
+            if t >= 1 {
+                fingerSpinPhaseState = .charging
+                fingerSpinTimer = 0
+                if fingerSpinBurstIndex >= fingerSpinBurstCount - 1 {
+                    fingerSpinBurstIndex = 0
+                    fingerSpinBurstCount = Int.random(in: 3...7)
+                    fingerSpinDuration = CGFloat.random(in: 0.09...0.13)
+                    fingerSpinPeakSpeed = CGFloat.random(in: 22.0...30.0)
+                    fingerSpinBaseSpeed = CGFloat.random(in: 1.0...1.45)
+                    fingerSpinCurrentSpeed = fingerSpinBaseSpeed
+                } else {
+                    fingerSpinBurstIndex += 1
+                    fingerSpinDuration = CGFloat.random(in: 0.08...0.12)
+                }
+            }
+        }
+
+        let spinBlend = 1 - pow(fingerSpinPhaseState == .charging ? 0.48 : 0.80, dt * 60.0)
+        visualSpinVelocityY += (targetY - visualSpinVelocityY) * spinBlend
+
+        let tilt = min(0.06, abs(visualSpinVelocityY) * 0.0025)
+        let targetX = tilt * sin(idleSpinPhase * 0.55)
+        let targetZ = tilt * cos(idleSpinPhase * 0.55)
+        let tiltBlend = 1 - pow(0.86, dt * 60.0)
+        visualSpinVelocityX += (targetX - visualSpinVelocityX) * tiltBlend
+        visualSpinVelocityZ += (targetZ - visualSpinVelocityZ) * tiltBlend
+    }
+
+    private func updateFieldBreezeIdle(dt: CGFloat, motionState: MotionState) {
+        decayExtraSpin(dt: dt, damping60: 0.88)
+
+        guard isFieldBreezeEligible(motionState: motionState) else { return }
+
+        physicalRollCountdown -= dt
+        if physicalRollCountdown <= 0 {
+            if Double.random(in: 0...1) < 0.32 { physicalRollDirection *= -1 }
+            physicalRollTargetSpeed = CGFloat.random(in: 55...155) * physicalRollDirection
+            physicalRollCountdown = CGFloat.random(in: 5.5...11.0)
+        }
+
+        let blend = 1 - pow(0.965, dt * 60.0)
+        ball.velocity.x += (physicalRollTargetSpeed - ball.velocity.x) * blend
+    }
+
+    private func isFieldBreezeEligible(motionState: MotionState) -> Bool {
+        guard ball.isResting(config: config, bounds: bounds) else { return false }
+        switch motionState {
+        case .idle:
+            return true
+        case .rolling:
+            return hypot(ball.velocity.x, ball.velocity.y) < 240
+        case .flying, .grabbed:
+            return false
+        }
+    }
+
+    private func decayExtraSpin(dt: CGFloat, damping60: CGFloat) {
+        let damping = pow(damping60, dt * 60.0)
+        visualSpinVelocityX *= damping
+        visualSpinVelocityY *= damping
+        visualSpinVelocityZ *= damping
+    }
+
+    private func applyOffAxisStrike(impulse: CGPoint,
+                                    strength: CGFloat,
+                                    contactOffset: CGPoint = .zero) {
+        let speed = hypot(impulse.x, impulse.y)
+        guard speed > 0 else { return }
+
+        let radius = max(config.radius, 1)
+        let maxOffset = radius * 0.78
+        let clampedOffset = clampVector(contactOffset, maxLength: maxOffset)
+        let miss = min(1, hypot(clampedOffset.x, clampedOffset.y) / maxOffset)
+        let frontBackOffset = sqrt(max(0, maxOffset * maxOffset
+                                       - clampedOffset.x * clampedOffset.x
+                                       - clampedOffset.y * clampedOffset.y)) * miss * 0.55
+        let scale = min(1.35, speed / 6_500) * (0.50 + 0.50 * strength)
+
+        // Billiards-style angular impulse: torque = r x p. A centre hit mainly
+        // changes translation; off-centre hits add spin whose sign follows the
+        // miss direction and the incoming impulse.
+        let rx = clampedOffset.x
+        let ry = clampedOffset.y
+        let rz = frontBackOffset
+        let torqueX = -rz * impulse.y
+        let torqueY = rz * impulse.x
+        let torqueZ = rx * impulse.y - ry * impulse.x
+
+        visualSpinVelocityX += torqueX / (radius * radius) * scale
+        visualSpinVelocityY += torqueY / (radius * radius) * scale
+        visualSpinVelocityZ += torqueZ / (radius * radius) * scale
+        visualSpinVelocityX = min(max(visualSpinVelocityX, -18), 18)
+        visualSpinVelocityY = min(max(visualSpinVelocityY, -18), 18)
+        visualSpinVelocityZ = min(max(visualSpinVelocityZ, -14), 14)
+    }
+
+    private func clampVector(_ vector: CGPoint, maxLength: CGFloat) -> CGPoint {
+        let length = hypot(vector.x, vector.y)
+        guard length > maxLength, length > 0 else { return vector }
+        let scale = maxLength / length
+        return CGPoint(x: vector.x * scale, y: vector.y * scale)
+    }
+
+    private func smoothStep(_ value: CGFloat) -> CGFloat {
+        let t = min(1, max(0, value))
+        return t * t * (3 - 2 * t)
+    }
+
+    private func easeOutCubic(_ value: CGFloat) -> CGFloat {
+        let t = min(1, max(0, value))
+        let inverse = 1 - t
+        return 1 - inverse * inverse * inverse
+    }
+
+    private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
+        a + (b - a) * min(1, max(0, t))
+    }
+
+    private func updateFPS(now: CFTimeInterval) {
+        guard showsFPS else { return }
+        if fpsSampleStart == 0 {
+            fpsSampleStart = now
+            fpsSampleFrames = 0
+            return
+        }
+        fpsSampleFrames += 1
+        let elapsed = now - fpsSampleStart
+        guard elapsed >= 0.5 else { return }
+        measuredFPS = Double(fpsSampleFrames) / elapsed
+        fpsSampleStart = now
+        fpsSampleFrames = 0
+    }
+
+    /// The union of every screen's play area — used only while the ball is
     /// being carried, so it can travel between displays. Offset/odd-sized displays
     /// leave "void" gaps inside the bounding box the ball can pass through.
     private func roamingBounds() -> Bounds {
         let screens = NSScreen.screens
         guard let first = screens.first else { return bounds }
-        let union = screens.dropFirst().reduce(first.visibleFrame) { $0.union($1.visibleFrame) }
+        let union = screens.dropFirst().reduce(Self.playArea(for: first).rect) { rect, screen in
+            rect.union(Self.playArea(for: screen).rect)
+        }
         return Bounds(rect: union)
     }
 
-    /// The visible frame of the screen the given point sits on — the play area when
+    /// The full viewport of the screen the given point sits on, with a fixed bottom
+    /// Dock clearance — the play area when
     /// the ball is free, so each display keeps its own edges. If the point is in a
     /// gap between displays (or off them all) we fall back to the nearest screen so
     /// the ball is pulled back onto a real display rather than lost in the void.
     private func screenBounds(containing point: CGPoint) -> Bounds {
         guard let screen = screen(containing: point) else { return bounds }
-        return Bounds(rect: screen.visibleFrame)
+        return Self.playArea(for: screen)
+    }
+
+    private static func playArea(for screen: NSScreen) -> Bounds {
+        Bounds(rect: screen.frame.insetByBottom(dockClearance))
     }
 
     private func screen(containing point: CGPoint) -> NSScreen? {
@@ -532,7 +854,6 @@ final class FootballPanel: NSPanel {
     ///   • Long gaps (0.7–0.9 s) so the ball visibly travels across the screen
     ///     between hits — each blow sends it from one edge toward the other.
     ///   • Impulse ESCALATES (2 200 → 2 750 pt/s) so the sequence builds to a peak.
-    ///   • Each hit squash-spikes the ball deformation for a crisp impact feel.
     ///   • Every hit spawns a ripple ring (overlay) + a blade slash mark.
     ///   • Combo lock prevents re-triggering until the last hit has played.
     ///
@@ -569,8 +890,11 @@ final class FootballPanel: NSPanel {
                     self.ball.velocity.x *= cap / spd
                     self.ball.velocity.y *= cap / spd
                 }
-                // Dramatic squash spike on each hit.
-                self.ball.squash = min(self.config.maxSquash * 1.3, self.ball.squash + 0.38)
+                self.applyOffAxisStrike(
+                    impulse: CGPoint(x: cos(angle) * capturedImpulse,
+                                     y: sin(angle) * capturedImpulse),
+                    strength: capturedPower
+                )
                 // Visual: ripple + blade slash.
                 EffectsOverlayPanel.shared.showStrikeEffect(at: self.ball.center, power: capturedPower)
                 EffectsOverlayPanel.shared.showSlashEffect(at: self.ball.center, angle: angle, power: capturedPower)
@@ -596,7 +920,8 @@ final class FootballPanel: NSPanel {
             ball.velocity.x *= cap / spd
             ball.velocity.y *= cap / spd
         }
-        ball.squash = min(config.maxSquash, ball.squash + 0.25 * multiplier / 4.0)
+        applyOffAxisStrike(impulse: CGPoint(x: ux * impulse, y: uy * impulse),
+                           strength: multiplier / 4.0)
         sound.playKick(strength: impulse * 0.75)
         EffectsOverlayPanel.shared.showStrikeEffect(at: ball.center, power: multiplier / 4.0 * 1.5)
     }
@@ -654,5 +979,12 @@ final class FootballPanel: NSPanel {
             sound.playKick(strength: 420)
         }
         didDrag = false
+    }
+}
+
+private extension CGRect {
+    func insetByBottom(_ amount: CGFloat) -> CGRect {
+        let inset = min(max(amount, 0), height)
+        return CGRect(x: minX, y: minY + inset, width: width, height: height - inset)
     }
 }

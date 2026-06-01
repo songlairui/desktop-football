@@ -23,13 +23,26 @@ final class MetalScene {
     private let guidePipeline: MTLRenderPipelineState
 
     // Meshes
-    private let ballMesh: MTKMesh
+    private var ballMesh: MTKMesh
+    private var ballLocalTransform = matrix_identity_float4x4
     private let groundMesh: MTKMesh
     private let shadowMesh: MTKMesh   // flat disc for shadow
+    private let ballVertexDescriptor: MTLVertexDescriptor
+    private var currentBallModelKind: BallModelKind = .fifa2026
 
     // Texture
-    private var skinTexture: MTLTexture!
     private let sampler: MTLSamplerState
+    private let footballFallbackTexture: MTLTexture
+    private let classicSoccerTexture: MTLTexture
+    private let basketballFallbackTexture: MTLTexture
+    private let defaultNormalTexture: MTLTexture
+    private let defaultMetallicTexture: MTLTexture
+    private let defaultRoughnessTexture: MTLTexture
+    private var baseColorTexture: MTLTexture!
+    private var normalTexture: MTLTexture!
+    private var metallicTexture: MTLTexture!
+    private var roughnessTexture: MTLTexture!
+
 
     // Camera
     private let camera = MetalCamera()
@@ -50,11 +63,9 @@ final class MetalScene {
 
         // ── Pipeline descriptors ──────────────────────────────────────────────
 
-        let ballVD = MTLVertexDescriptor()
-        ballVD.attributes[0].format = .float3; ballVD.attributes[0].offset = 0;  ballVD.attributes[0].bufferIndex = 0
-        ballVD.attributes[1].format = .float3; ballVD.attributes[1].offset = 12; ballVD.attributes[1].bufferIndex = 0
-        ballVD.attributes[2].format = .float2; ballVD.attributes[2].offset = 24; ballVD.attributes[2].bufferIndex = 0
-        ballVD.layouts[0].stride = 32
+        let ballVD = Self.makeVertexDescriptor(includeTangent: true)
+        let simpleVD = Self.makeVertexDescriptor(includeTangent: false)
+        self.ballVertexDescriptor = ballVD
 
         let ballPD = MTLRenderPipelineDescriptor()
         ballPD.vertexFunction   = library.makeFunction(name: "ballVertex")
@@ -69,11 +80,11 @@ final class MetalScene {
         guard let bp = try? device.makeRenderPipelineState(descriptor: ballPD) else { return nil }
         self.ballPipeline = bp
 
-        // Ground pipeline — same vertex layout
+        // Ground pipeline — no tangent data needed.
         let groundPD = MTLRenderPipelineDescriptor()
         groundPD.vertexFunction   = library.makeFunction(name: "groundVertex")
         groundPD.fragmentFunction = library.makeFunction(name: "groundFragment")
-        groundPD.vertexDescriptor = ballVD
+        groundPD.vertexDescriptor = simpleVD
         groundPD.colorAttachments[0].pixelFormat = .bgra8Unorm
         groundPD.colorAttachments[0].isBlendingEnabled = true
         groundPD.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
@@ -83,11 +94,11 @@ final class MetalScene {
         guard let gp = try? device.makeRenderPipelineState(descriptor: groundPD) else { return nil }
         self.groundPipeline = gp
 
-        // Shadow pipeline — same vertex layout
+        // Shadow pipeline — no tangent data needed.
         let shadowPD = MTLRenderPipelineDescriptor()
         shadowPD.vertexFunction   = library.makeFunction(name: "shadowVertex")
         shadowPD.fragmentFunction = library.makeFunction(name: "shadowFragment")
-        shadowPD.vertexDescriptor = ballVD
+        shadowPD.vertexDescriptor = simpleVD
         shadowPD.colorAttachments[0].pixelFormat = .bgra8Unorm
         shadowPD.colorAttachments[0].isBlendingEnabled = true
         shadowPD.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
@@ -111,25 +122,52 @@ final class MetalScene {
 
         // ── Meshes via ModelIO ────────────────────────────────────────────────
 
-        let mtkVD = MTKModelIOVertexDescriptorFromMetal(ballVD)
-        (mtkVD.attributes[0] as! MDLVertexAttribute).name = MDLVertexAttributePosition
-        (mtkVD.attributes[1] as! MDLVertexAttribute).name = MDLVertexAttributeNormal
-        (mtkVD.attributes[2] as! MDLVertexAttribute).name = MDLVertexAttributeTextureCoordinate
+        let ballMTKVD = Self.makeModelIOVertexDescriptor(from: ballVD, includeTangent: true)
+        let simpleMTKVD = Self.makeModelIOVertexDescriptor(from: simpleVD, includeTangent: false)
 
-        let ballAsset = MDLMesh(sphereWithExtent: vector_float3(2, 2, 2),
-                                segments: vector_uint2(48, 48),
-                                inwardNormals: false,
-                                geometryType: MDLGeometryType.triangles,
-                                allocator: MTKMeshBufferAllocator(device: device))
-        ballAsset.vertexDescriptor = mtkVD
-        guard let ballMesh = try? MTKMesh(mesh: ballAsset, device: device) else { return nil }
-        self.ballMesh = ballMesh
+        // ── Texture ───────────────────────────────────────────────────────────
 
+        let proceduralTexture = Self.makeFootballTexture(device: device)
+        let classicTexture = Self.makeClassicSoccerTexture(device: device)
+        let basketballTexture = Self.makeBasketballTexture(device: device)
+        guard let defaultNormal = Self.makeSolidTexture(device: device, rgba: [128, 128, 255, 255]),
+              let defaultMetallic = Self.makeSolidTexture(device: device, rgba: [0, 0, 0, 255]),
+              let defaultRoughness = Self.makeSolidTexture(device: device, rgba: [180, 180, 180, 255])
+        else { return nil }
+        footballFallbackTexture = proceduralTexture
+        classicSoccerTexture = classicTexture
+        basketballFallbackTexture = basketballTexture
+        defaultNormalTexture = defaultNormal
+        defaultMetallicTexture = defaultMetallic
+        defaultRoughnessTexture = defaultRoughness
+        baseColorTexture = proceduralTexture
+        normalTexture = defaultNormal
+        metallicTexture = defaultMetallic
+        roughnessTexture = defaultRoughness
+
+        // 先尝试加载 USDZ 模型
+        if let usdzModel = BallModel.loadUSDZ(kind: .fifa2026,
+                                              device: device,
+                                              vertexDescriptor: ballVD) {
+            self.ballMesh = usdzModel.mesh
+            self.ballLocalTransform = usdzModel.normalizationTransform
+            self.baseColorTexture = usdzModel.material.baseColor ?? proceduralTexture
+            self.normalTexture = usdzModel.material.normal ?? defaultNormal
+            self.metallicTexture = usdzModel.material.metallic ?? defaultMetallic
+            self.roughnessTexture = usdzModel.material.roughness ?? defaultRoughness
+            print("✅ 使用 USDZ Trionda 模型")
+        } else {
+            // Fallback: 使用程序化 sphere
+            guard let ballMesh = Self.makeFallbackBallMesh(device: device,
+                                                           modelIOVertexDescriptor: ballMTKVD) else { return nil }
+            self.ballMesh = ballMesh
+            print("⚠️ USDZ 加载失败，使用程序化 sphere")
+        }
         let groundAsset = MDLMesh(planeWithExtent: vector_float3(4000, 1, 4000),
                                    segments: vector_uint2(2, 2),
                                    geometryType: MDLGeometryType.triangles,
                                    allocator: MTKMeshBufferAllocator(device: device))
-        groundAsset.vertexDescriptor = mtkVD
+        groundAsset.vertexDescriptor = simpleMTKVD
         // We need to rotate the plane to lie on the XZ plane (Y = 0).
         // MDLMesh.newPlane creates it on XY by default. We apply a rotation in
         // the vertex shader via the model matrix, or just patch the mesh.
@@ -144,13 +182,9 @@ final class MetalScene {
                                    inwardNormals: false,
                                    geometryType: MDLGeometryType.triangles,
                                    allocator: MTKMeshBufferAllocator(device: device))
-        shadowAsset.vertexDescriptor = mtkVD
+        shadowAsset.vertexDescriptor = simpleMTKVD
         guard let shadowMesh = try? MTKMesh(mesh: shadowAsset, device: device) else { return nil }
         self.shadowMesh = shadowMesh
-
-        // ── Texture ───────────────────────────────────────────────────────────
-
-        skinTexture = Self.makeFootballTexture(device: device)
 
         let sd = MTLSamplerDescriptor()
         sd.minFilter = .linear; sd.magFilter = .linear
@@ -159,13 +193,77 @@ final class MetalScene {
         self.sampler = sampler
     }
 
+    func setBallModel(_ kind: BallModelKind) {
+        guard kind != currentBallModelKind else { return }
+
+        if kind.isProcedural {
+            let modelIOVD = Self.makeModelIOVertexDescriptor(from: ballVertexDescriptor,
+                                                             includeTangent: true)
+            guard let fallbackMesh = Self.makeFallbackBallMesh(device: device,
+                                                               modelIOVertexDescriptor: modelIOVD) else {
+                print("⚠️ 切换球模型失败，保留当前模型：\(kind.menuTitle)")
+                return
+            }
+            ballMesh = fallbackMesh
+            ballLocalTransform = matrix_identity_float4x4
+            applyMaterial(PBRMaterial(), fallbackBaseColor: fallbackBaseTexture(for: kind))
+            currentBallModelKind = kind
+            print("✅ 切换球模型：\(kind.menuTitle)（程序化球面）")
+            return
+        }
+
+        if let model = BallModel.loadUSDZ(kind: kind,
+                                          device: device,
+                                          vertexDescriptor: ballVertexDescriptor) {
+            ballMesh = model.mesh
+            ballLocalTransform = model.normalizationTransform
+            applyMaterial(model.material, fallbackBaseColor: fallbackBaseTexture(for: kind))
+            currentBallModelKind = kind
+            print("✅ 切换球模型：\(kind.menuTitle)")
+            return
+        }
+
+        let modelIOVD = Self.makeModelIOVertexDescriptor(from: ballVertexDescriptor,
+                                                         includeTangent: true)
+        guard let fallbackMesh = Self.makeFallbackBallMesh(device: device,
+                                                           modelIOVertexDescriptor: modelIOVD) else {
+            print("⚠️ 切换球模型失败，保留当前模型：\(kind.menuTitle)")
+            return
+        }
+        ballMesh = fallbackMesh
+        ballLocalTransform = matrix_identity_float4x4
+        applyMaterial(PBRMaterial(), fallbackBaseColor: fallbackBaseTexture(for: kind))
+        currentBallModelKind = kind
+        print("⚠️ \(kind.menuTitle) USDZ 加载失败，使用程序化 sphere")
+    }
+
+    private func applyMaterial(_ material: PBRMaterial, fallbackBaseColor: MTLTexture) {
+        baseColorTexture = material.baseColor ?? fallbackBaseColor
+        normalTexture = material.normal ?? defaultNormalTexture
+        metallicTexture = material.metallic ?? defaultMetallicTexture
+        roughnessTexture = material.roughness ?? defaultRoughnessTexture
+    }
+
+    private func fallbackBaseTexture(for kind: BallModelKind) -> MTLTexture {
+        switch kind {
+        case .classicSoccer:
+            return classicSoccerTexture
+        case .basketball:
+            return basketballFallbackTexture
+        case .fifa2026, .football:
+            return footballFallbackTexture
+        }
+    }
+
     /// Render one frame into the provided drawable + depth texture.
     func draw(in drawable: CAMetalDrawable,
               depthTexture: MTLTexture,
               ballState: BallState,
               config: PhysicsConfig,
               bounds: Bounds,
-              viewport: CGRect) {
+              viewport: CGRect,
+              renderEffects: BallRenderEffects,
+              showsGuideLines: Bool) {
 
         guard let buffer = commandQueue.makeCommandBuffer(),
               let encoder = buffer.makeRenderCommandEncoder(descriptor: {
@@ -183,32 +281,42 @@ final class MetalScene {
 
         // ── Build uniforms ────────────────────────────────────────────────────
         let aspect = Float(drawable.texture.width) / Float(drawable.texture.height)
-        uniforms.projection = camera.projectionMatrix(aspect: aspect)
-        uniforms.view = camera.viewMatrix()
+        let pointsToWorld = tankPointsToWorld(viewport: viewport)
+        let scale = max(8, Float(config.radius) * pointsToWorld)
+        let visualScale: Float = 1.0
+        let visualRadius = scale * visualScale
+        let mapping = tankMapping(bounds: bounds,
+                                  viewport: viewport,
+                                  pointsToWorld: pointsToWorld,
+                                  visualRadius: visualRadius)
+        uniforms.projection = camera.projectionMatrix(aspect: aspect, frontHeight: mapping.height)
+        uniforms.view = camera.viewMatrix(frontHeight: mapping.height)
 
-        let mapping = tankMapping(bounds: bounds, viewport: viewport)
-        let scale = max(8, Float(config.radius) * mapping.pointsToWorld)
-        let worldBall = screenToTankWorld(ballState.center, worldRadius: scale,
-                                          screenRadius: config.radius, bounds: bounds,
+        let worldBall = screenToTankWorld(ballState.center,
                                           mapping: mapping)
         uniforms.model = float4x4(translation: worldBall)
-            * float4x4(rotationY: Float(ballState.angle))
-            * float4x4(scale: SIMD3<Float>(scale, scale, scale))
-        uniforms.squash = Float(ballState.squash)
-        uniforms.ballRadius = scale
-        uniforms.lightPos = SIMD3<Float>(0, 800, 600)
-        uniforms.viewPos = camera.eye
+            * float4x4(rotationY: Float(renderEffects.rotationY))
+            * float4x4(rotationX: Float(renderEffects.rotationX))
+            * float4x4(rotationZ: Float(ballState.angle + renderEffects.rotationZ))
+            * float4x4(scale: SIMD3<Float>(visualRadius, visualRadius, visualRadius))
+        uniforms.localModel = ballLocalTransform
+        uniforms.squash = 0
+        uniforms.ballRadius = visualRadius
+        uniforms.lightPos = SIMD3<Float>(-220, mapping.height + 520, 680)
+        uniforms.viewPos = camera.eye(frontHeight: mapping.height)
 
         // The desktop is the visible ground; draw only local helper lines so the
         // 3D relation is readable without tinting the whole screen.
-        drawGuideLines(encoder: encoder, center: worldBall, radius: scale, mapping: mapping)
+        if showsGuideLines {
+            drawGuideLines(encoder: encoder, center: worldBall, radius: visualRadius, mapping: mapping)
+        }
 
         // ── Shadow disc ───────────────────────────────────────────────────────
         encoder.setRenderPipelineState(shadowPipeline)
         encoder.setDepthStencilState(makeDepthState(device, readOnly: true))
         var shadowUniforms = uniforms
-        let shadowScale = scale * 1.5
-        shadowUniforms.model = float4x4(translation: SIMD3<Float>(worldBall.x, 0.5, worldBall.z))
+        let shadowScale = visualRadius * 1.08
+        shadowUniforms.model = float4x4(translation: SIMD3<Float>(worldBall.x, mapping.floorY + 0.5, worldBall.z))
             * float4x4(scale: SIMD3<Float>(shadowScale, shadowScale, shadowScale))
         encoder.setVertexBytes(&shadowUniforms, length: MemoryLayout<SceneUniforms>.stride, index: 1)
         let svBuf = shadowMesh.vertexBuffers[0]
@@ -226,8 +334,13 @@ final class MetalScene {
         encoder.setDepthStencilState(makeDepthState(device, readOnly: false))
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<SceneUniforms>.stride, index: 1)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<SceneUniforms>.stride, index: 1)
-        encoder.setFragmentTexture(skinTexture, index: 0)
+
+        encoder.setFragmentTexture(baseColorTexture, index: 0)
+        encoder.setFragmentTexture(normalTexture, index: 1)
+        encoder.setFragmentTexture(metallicTexture, index: 2)
+        encoder.setFragmentTexture(roughnessTexture, index: 3)
         encoder.setFragmentSamplerState(sampler, index: 0)
+
         let bvBuf = ballMesh.vertexBuffers[0]
         encoder.setVertexBuffer(bvBuf.buffer, offset: bvBuf.offset, index: 0)
         for sub in ballMesh.submeshes {
@@ -245,26 +358,37 @@ final class MetalScene {
 
     // MARK: - Coordinate mapping
 
-    private func tankMapping(bounds: Bounds, viewport: CGRect) -> TankMapping {
+    private func tankPointsToWorld(viewport: CGRect) -> Float {
         let tankHeight: Float = 620
-        let pointsToWorld = tankHeight / max(Float(bounds.rect.height), 1)
-        let halfWidth = Float(bounds.rect.width) * pointsToWorld * 0.5
+        return tankHeight / max(Float(viewport.height), 1)
+    }
+
+    private func tankMapping(
+        bounds: Bounds,
+        viewport: CGRect,
+        pointsToWorld: Float,
+        visualRadius: Float
+    ) -> TankMapping {
+        let tankHeight: Float = 620
+        let halfWidth = Float(viewport.width) * pointsToWorld * 0.5
+        let floorY = Float(bounds.rect.minY - viewport.minY) * pointsToWorld
+        let halfDepth = max(visualRadius * 3, 120)
         return TankMapping(pointsToWorld: pointsToWorld,
                            height: tankHeight,
                            minX: -halfWidth,
                            maxX: halfWidth,
-                           minZ: -360,
-                           maxZ: 360)
+                           minZ: -halfDepth,
+                           maxZ: halfDepth,
+                           floorY: floorY,
+                           screenMidX: Float(viewport.midX),
+                           screenMinY: Float(viewport.minY))
     }
 
     private func screenToTankWorld(_ screen: CGPoint,
-                                   worldRadius: Float,
-                                   screenRadius: CGFloat,
-                                   bounds: Bounds,
                                    mapping: TankMapping) -> SIMD3<Float> {
-        let x = Float(screen.x - bounds.rect.midX) * mapping.pointsToWorld
-        let lift = max(0, Float(screen.y - bounds.floorY(radius: screenRadius)) * mapping.pointsToWorld)
-        return SIMD3<Float>(x, worldRadius + lift, 0)
+        let x = (Float(screen.x) - mapping.screenMidX) * mapping.pointsToWorld
+        let y = (Float(screen.y) - mapping.screenMinY) * mapping.pointsToWorld
+        return SIMD3<Float>(x, y, 0)
     }
 
     private func drawGuideLines(encoder: MTLRenderCommandEncoder,
@@ -272,7 +396,7 @@ final class MetalScene {
                                 radius: Float,
                                 mapping: TankMapping) {
         var vertices: [GuideVertex] = []
-        let floorY: Float = 0.75
+        let floorY = mapping.floorY + 0.75
         let step: Float = 80
         let floorMinor = SIMD4<Float>(0.45, 0.75, 1.0, 0.055)
         let floorMajor = SIMD4<Float>(0.70, 0.92, 1.0, 0.12)
@@ -356,7 +480,82 @@ final class MetalScene {
         encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: vertices.count)
     }
 
+    // MARK: - Mesh layout
+
+    private static func makeFallbackBallMesh(
+        device: MTLDevice,
+        modelIOVertexDescriptor: MDLVertexDescriptor
+    ) -> MTKMesh? {
+        let ballAsset = MDLMesh(sphereWithExtent: vector_float3(2, 2, 2),
+                                segments: vector_uint2(48, 48),
+                                inwardNormals: false,
+                                geometryType: MDLGeometryType.triangles,
+                                allocator: MTKMeshBufferAllocator(device: device))
+        ballAsset.vertexDescriptor = modelIOVertexDescriptor
+        BallModel.ensureTangents(mesh: ballAsset)
+        return try? MTKMesh(mesh: ballAsset, device: device)
+    }
+
+    private static func makeVertexDescriptor(includeTangent: Bool) -> MTLVertexDescriptor {
+        let descriptor = MTLVertexDescriptor()
+        descriptor.attributes[0].format = .float3
+        descriptor.attributes[0].offset = 0
+        descriptor.attributes[0].bufferIndex = 0
+        descriptor.attributes[1].format = .float3
+        descriptor.attributes[1].offset = 12
+        descriptor.attributes[1].bufferIndex = 0
+        descriptor.attributes[2].format = .float2
+        descriptor.attributes[2].offset = 24
+        descriptor.attributes[2].bufferIndex = 0
+        if includeTangent {
+            descriptor.attributes[3].format = .float3
+            descriptor.attributes[3].offset = 32
+            descriptor.attributes[3].bufferIndex = 0
+        }
+        descriptor.layouts[0].stride = includeTangent ? 44 : 32
+        return descriptor
+    }
+
+    private static func makeModelIOVertexDescriptor(
+        from descriptor: MTLVertexDescriptor,
+        includeTangent: Bool
+    ) -> MDLVertexDescriptor {
+        let modelIODescriptor = MTKModelIOVertexDescriptorFromMetal(descriptor)
+        (modelIODescriptor.attributes[0] as! MDLVertexAttribute).name = MDLVertexAttributePosition
+        (modelIODescriptor.attributes[1] as! MDLVertexAttribute).name = MDLVertexAttributeNormal
+        (modelIODescriptor.attributes[2] as! MDLVertexAttribute).name = MDLVertexAttributeTextureCoordinate
+        if includeTangent {
+            (modelIODescriptor.attributes[3] as! MDLVertexAttribute).name = MDLVertexAttributeTangent
+        }
+        return modelIODescriptor
+    }
+
     // MARK: - Procedural texture
+
+    private static func makeSolidTexture(device: MTLDevice, rgba: [UInt8]) -> MTLTexture? {
+        guard rgba.count == 4 else { return nil }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: 1,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead]
+        guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
+        let pixel = rgba
+        pixel.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress {
+                texture.replace(
+                    region: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
+                                      size: MTLSize(width: 1, height: 1, depth: 1)),
+                    mipmapLevel: 0,
+                    withBytes: baseAddress,
+                    bytesPerRow: 4
+                )
+            }
+        }
+        return texture
+    }
 
     private static func makeFootballTexture(device: MTLDevice) -> MTLTexture {
         let size = 1024
@@ -413,6 +612,304 @@ final class MetalScene {
                                        size: MTLSize(width: size, height: size, depth: 1)),
                     mipmapLevel: 0, withBytes: data, bytesPerRow: bytesPerRow)
         return tex
+    }
+
+    private static func makeBasketballTexture(device: MTLDevice) -> MTLTexture {
+        let size = 1024
+        let bytesPerPixel = 4
+        let bytesPerRow = size * bytesPerPixel
+        var data = [UInt8](repeating: 0, count: size * size * bytesPerPixel)
+
+        guard let ctx = CGContext(data: &data, width: size, height: size,
+                                  bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return Self.fallbackTexture(device: device) }
+
+        let s = CGFloat(size)
+        ctx.setAllowsAntialiasing(true)
+        ctx.setShouldAntialias(true)
+        ctx.setFillColor(CGColor(red: 0.93, green: 0.42, blue: 0.12, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: s, height: s))
+
+        for i in stride(from: 0, through: Int(s), by: 9) {
+            let y = CGFloat(i)
+            let alpha = 0.035 + 0.025 * abs(sin(CGFloat(i) * 0.31))
+            ctx.setStrokeColor(CGColor(red: 0.22, green: 0.09, blue: 0.025, alpha: alpha))
+            ctx.setLineWidth(s * 0.0011)
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: 0, y: y))
+            path.addCurve(to: CGPoint(x: s, y: y + sin(y * 0.018) * s * 0.004),
+                          control1: CGPoint(x: s * 0.28, y: y + s * 0.012),
+                          control2: CGPoint(x: s * 0.72, y: y - s * 0.012))
+            ctx.addPath(path)
+            ctx.strokePath()
+        }
+
+        func strokeSeam(_ path: CGPath, width: CGFloat = 0.028) {
+            ctx.saveGState()
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            ctx.setStrokeColor(CGColor(red: 0.05, green: 0.026, blue: 0.012, alpha: 0.92))
+            ctx.setLineWidth(s * width)
+            ctx.addPath(path)
+            ctx.strokePath()
+            ctx.setStrokeColor(CGColor(red: 1.0, green: 0.74, blue: 0.35, alpha: 0.20))
+            ctx.setLineWidth(s * width * 0.24)
+            ctx.addPath(path)
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
+
+        let horizontal = CGMutablePath()
+        horizontal.move(to: CGPoint(x: -s * 0.02, y: s * 0.50))
+        horizontal.addCurve(to: CGPoint(x: s * 1.02, y: s * 0.50),
+                            control1: CGPoint(x: s * 0.28, y: s * 0.43),
+                            control2: CGPoint(x: s * 0.72, y: s * 0.57))
+        strokeSeam(horizontal)
+
+        let vertical = CGMutablePath()
+        vertical.move(to: CGPoint(x: s * 0.50, y: -s * 0.02))
+        vertical.addCurve(to: CGPoint(x: s * 0.50, y: s * 1.02),
+                          control1: CGPoint(x: s * 0.43, y: s * 0.28),
+                          control2: CGPoint(x: s * 0.57, y: s * 0.72))
+        strokeSeam(vertical)
+
+        for x in [s * 0.19, s * 0.81] {
+            let curve = CGMutablePath()
+            curve.move(to: CGPoint(x: x, y: -s * 0.05))
+            curve.addCurve(to: CGPoint(x: x, y: s * 1.05),
+                           control1: CGPoint(x: s * 0.50, y: s * 0.22),
+                           control2: CGPoint(x: s * 0.50, y: s * 0.78))
+            strokeSeam(curve, width: 0.024)
+        }
+
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                           width: size, height: size,
+                                                           mipmapped: false)
+        td.usage = [.shaderRead]
+        guard let tex = device.makeTexture(descriptor: td) else {
+            return Self.fallbackTexture(device: device)
+        }
+        for i in 0..<(size * size) {
+            let base = i * 4
+            data.swapAt(base, base + 2)
+        }
+        tex.replace(region: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
+                                       size: MTLSize(width: size, height: size, depth: 1)),
+                    mipmapLevel: 0, withBytes: data, bytesPerRow: bytesPerRow)
+        return tex
+    }
+
+    private static func makeClassicSoccerTexture(device: MTLDevice) -> MTLTexture {
+        let size = 1024
+        let bytesPerPixel = 4
+        let bytesPerRow = size * bytesPerPixel
+        var data = [UInt8](repeating: 0, count: size * size * bytesPerPixel)
+
+        guard let ctx = CGContext(data: &data, width: size, height: size,
+                                  bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return Self.fallbackTexture(device: device) }
+
+        let s = CGFloat(size)
+        ctx.setAllowsAntialiasing(true)
+        ctx.setShouldAntialias(true)
+        ctx.setLineJoin(.round)
+        ctx.setLineCap(.round)
+
+        ctx.setFillColor(CGColor(red: 0.94, green: 0.935, blue: 0.895, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: s, height: s))
+
+        Self.drawSoccerLeatherGrain(ctx, size: s)
+        Self.drawClassicSoccerPanels(ctx, size: s)
+
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                           width: size, height: size,
+                                                           mipmapped: false)
+        td.usage = [.shaderRead]
+        guard let tex = device.makeTexture(descriptor: td) else {
+            return Self.fallbackTexture(device: device)
+        }
+        for i in 0..<(size * size) {
+            let base = i * 4
+            data.swapAt(base, base + 2)
+        }
+        tex.replace(region: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
+                                       size: MTLSize(width: size, height: size, depth: 1)),
+                    mipmapLevel: 0, withBytes: data, bytesPerRow: bytesPerRow)
+        return tex
+    }
+
+    private static func drawSoccerLeatherGrain(_ ctx: CGContext, size s: CGFloat) {
+        ctx.saveGState()
+        ctx.setLineWidth(s * 0.0009)
+        for i in stride(from: 0, through: Int(s), by: 13) {
+            let y = CGFloat(i)
+            let alpha = 0.018 + 0.014 * abs(sin(CGFloat(i) * 0.27))
+            ctx.setStrokeColor(CGColor(red: 0.20, green: 0.20, blue: 0.18, alpha: alpha))
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: 0, y: y))
+            path.addCurve(to: CGPoint(x: s, y: y + sin(y * 0.025) * s * 0.004),
+                          control1: CGPoint(x: s * 0.25, y: y + s * 0.006),
+                          control2: CGPoint(x: s * 0.72, y: y - s * 0.006))
+            ctx.addPath(path)
+            ctx.strokePath()
+        }
+        ctx.restoreGState()
+    }
+
+    private static func drawClassicSoccerPanels(_ ctx: CGContext, size s: CGFloat) {
+        let black = CGColor(red: 0.025, green: 0.026, blue: 0.028, alpha: 1)
+        let seam = CGColor(red: 0.24, green: 0.23, blue: 0.20, alpha: 0.54)
+        let seamLight = CGColor(red: 1.0, green: 0.985, blue: 0.90, alpha: 0.64)
+        let whitePanel = CGColor(red: 0.965, green: 0.955, blue: 0.91, alpha: 1)
+        let shadowStroke = CGColor(red: 0.08, green: 0.08, blue: 0.075, alpha: 0.20)
+
+        func drawMotif(center: CGPoint, scale: CGFloat, rotation: CGFloat) {
+            let pentagonRadius = scale * 0.235
+            let hexRadius = scale * 0.225
+            let hexDistance = scale * 0.405
+
+            for i in 0..<5 {
+                let a = rotation - .pi / 2 + CGFloat(i) * 2 * .pi / 5
+                let c = CGPoint(x: center.x + cos(a) * hexDistance,
+                                y: center.y + sin(a) * hexDistance)
+                Self.drawPolygon(ctx,
+                                 center: c,
+                                 radius: hexRadius,
+                                 sides: 6,
+                                 angle: a + .pi / 6,
+                                 fill: whitePanel,
+                                 stroke: seam,
+                                 lineWidth: scale * 0.030)
+                Self.drawPolygon(ctx,
+                                 center: c,
+                                 radius: hexRadius * 0.96,
+                                 sides: 6,
+                                 angle: a + .pi / 6,
+                                 fill: nil,
+                                 stroke: seamLight,
+                                 lineWidth: scale * 0.008)
+            }
+
+            for i in 0..<5 {
+                let a = rotation - .pi / 2 + CGFloat(i) * 2 * .pi / 5
+                let path = CGMutablePath()
+                path.move(to: CGPoint(x: center.x + cos(a) * pentagonRadius * 0.92,
+                                      y: center.y + sin(a) * pentagonRadius * 0.92))
+                path.addLine(to: CGPoint(x: center.x + cos(a) * hexDistance * 0.72,
+                                         y: center.y + sin(a) * hexDistance * 0.72))
+                ctx.setStrokeColor(seam)
+                ctx.setLineWidth(scale * 0.020)
+                ctx.addPath(path)
+                ctx.strokePath()
+            }
+
+            Self.drawPolygon(ctx,
+                             center: center,
+                             radius: pentagonRadius,
+                             sides: 5,
+                             angle: rotation - .pi / 2,
+                             fill: black,
+                             stroke: seam,
+                             lineWidth: scale * 0.032)
+            Self.drawPolygon(ctx,
+                             center: center,
+                             radius: pentagonRadius * 0.92,
+                             sides: 5,
+                             angle: rotation - .pi / 2,
+                             fill: nil,
+                             stroke: CGColor(red: 1, green: 1, blue: 1, alpha: 0.12),
+                             lineWidth: scale * 0.010)
+
+            ctx.saveGState()
+            ctx.setStrokeColor(shadowStroke)
+            ctx.setLineWidth(scale * 0.006)
+            for i in 0..<5 {
+                let a = rotation - .pi / 2 + CGFloat(i) * 2 * .pi / 5 + .pi / 5
+                let p0 = CGPoint(x: center.x + cos(a) * scale * 0.18,
+                                 y: center.y + sin(a) * scale * 0.18)
+                let p1 = CGPoint(x: center.x + cos(a) * scale * 0.56,
+                                 y: center.y + sin(a) * scale * 0.56)
+                let path = CGMutablePath()
+                path.move(to: p0)
+                path.addLine(to: p1)
+                ctx.addPath(path)
+                ctx.strokePath()
+            }
+            ctx.restoreGState()
+        }
+
+        let rows: [(CGFloat, CGFloat, CGFloat)] = [
+            (0.16, 0.19, 0.27),
+            (0.34, 0.41, -0.08),
+            (0.16, 0.63, 0.18),
+            (0.34, 0.85, -0.20),
+        ]
+        let stepX = s / 3
+        for row in rows {
+            var x = row.0 * s - stepX
+            while x < s * 1.34 {
+                let scale = s * 0.30
+                drawMotif(center: CGPoint(x: x, y: row.1 * s),
+                          scale: scale,
+                          rotation: row.2 + x * 0.002)
+                x += stepX
+            }
+        }
+
+        ctx.saveGState()
+        ctx.setStrokeColor(CGColor(red: 0.36, green: 0.34, blue: 0.29, alpha: 0.16))
+        ctx.setLineWidth(s * 0.003)
+        for y in stride(from: s * 0.10, through: s * 0.92, by: s * 0.135) {
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: -s * 0.04, y: y))
+            path.addCurve(to: CGPoint(x: s * 1.04, y: y + s * 0.012),
+                          control1: CGPoint(x: s * 0.30, y: y - s * 0.035),
+                          control2: CGPoint(x: s * 0.68, y: y + s * 0.035))
+            ctx.addPath(path)
+            ctx.strokePath()
+        }
+        ctx.restoreGState()
+    }
+
+    private static func drawPolygon(_ ctx: CGContext,
+                                    center: CGPoint,
+                                    radius: CGFloat,
+                                    sides: Int,
+                                    angle: CGFloat,
+                                    fill: CGColor?,
+                                    stroke: CGColor?,
+                                    lineWidth: CGFloat) {
+        guard sides >= 3 else { return }
+        let path = CGMutablePath()
+        for i in 0..<sides {
+            let a = angle + CGFloat(i) * 2 * .pi / CGFloat(sides)
+            let p = CGPoint(x: center.x + cos(a) * radius,
+                            y: center.y + sin(a) * radius)
+            if i == 0 {
+                path.move(to: p)
+            } else {
+                path.addLine(to: p)
+            }
+        }
+        path.closeSubpath()
+
+        ctx.saveGState()
+        if let fill {
+            ctx.setFillColor(fill)
+            ctx.addPath(path)
+            ctx.fillPath()
+        }
+        if let stroke, lineWidth > 0 {
+            ctx.setStrokeColor(stroke)
+            ctx.setLineWidth(lineWidth)
+            ctx.addPath(path)
+            ctx.strokePath()
+        }
+        ctx.restoreGState()
     }
 
     private static func drawBaseGrain(_ ctx: CGContext, size s: CGFloat) {
@@ -722,69 +1219,135 @@ final class MetalScene {
         float4x4 projection;
         float4x4 view;
         float4x4 model;
+        float4x4 localModel;
         float3   lightPos;
         float3   viewPos;
         float    squash;
         float    ballRadius;
     };
 
-    struct VertexIn {
+    struct BallVertexIn {
+        float3 position  [[attribute(0)]];
+        float3 normal    [[attribute(1)]];
+        float2 texCoord  [[attribute(2)]];
+        float3 tangent   [[attribute(3)]];
+    };
+
+    struct BallVertexOut {
+        float4 position  [[position]];
+        float3 worldPos;
+        float3 worldNormal;
+        float3 worldTangent;
+        float2 uv;
+    };
+
+    struct SurfaceVertexIn {
         float3 position  [[attribute(0)]];
         float3 normal    [[attribute(1)]];
         float2 texCoord  [[attribute(2)]];
     };
 
-    struct VertexOut {
+    struct SurfaceVertexOut {
         float4 position  [[position]];
         float3 worldPos;
         float3 worldNormal;
         float2 uv;
     };
 
-    vertex VertexOut ballVertex(VertexIn in [[stage_in]],
-                                constant SceneUniforms &u [[buffer(1)]]) {
-        VertexOut out;
-        float sq = u.squash;
-        float sy = 1.0 - sq;
-        float sxz = sqrt(1.0 / max(sy, 0.3));
-        float3 p = float3(in.position.x * sxz,
-                          in.position.y * sy,
-                          in.position.z * sxz);
-        float3 n = normalize(float3(in.normal.x / sxz,
-                                     in.normal.y / sy,
-                                     in.normal.z / sxz));
+    vertex BallVertexOut ballVertex(BallVertexIn in [[stage_in]],
+                                    constant SceneUniforms &u [[buffer(1)]]) {
+        BallVertexOut out;
+        float4 localPos4 = u.localModel * float4(in.position, 1.0);
+        float3 localPosition = localPos4.xyz;
+        float3 localNormal = normalize((u.localModel * float4(in.normal, 0.0)).xyz);
+        float3 localTangent = normalize((u.localModel * float4(in.tangent, 0.0)).xyz);
+
+        float3 p = localPosition;
+        float3 n = localNormal;
+        float3 t = localTangent;
         float4 worldPos = u.model * float4(p, 1.0);
         out.position = u.projection * u.view * worldPos;
         out.worldPos = worldPos.xyz;
         out.worldNormal = normalize((u.model * float4(n, 0.0)).xyz);
+        out.worldTangent = normalize((u.model * float4(t, 0.0)).xyz);
         out.uv = in.texCoord;
         return out;
     }
 
-    fragment float4 ballFragment(VertexOut in [[stage_in]],
+    fragment float4 ballFragment(BallVertexOut in [[stage_in]],
                                  constant SceneUniforms &u [[buffer(1)]],
                                  texture2d<float> skinTexture [[texture(0)]],
+                                 texture2d<float> normalTexture [[texture(1)]],
+                                 texture2d<float> metallicTexture [[texture(2)]],
+                                 texture2d<float> roughnessTexture [[texture(3)]],
                                  sampler texSampler [[sampler(0)]]) {
-        float3 N = normalize(in.worldNormal);
+        float3 macroN = normalize(in.worldNormal);
+        float3 T = normalize(in.worldTangent - macroN * dot(macroN, in.worldTangent));
+        float3 B = normalize(cross(macroN, T));
+        float3x3 TBN = float3x3(T, B, macroN);
+
+        float3 normalSample = normalTexture.sample(texSampler, in.uv).xyz * 2.0 - 1.0;
+        float3 detailN = normalize(TBN * normalSample);
+
+        float3 albedo = skinTexture.sample(texSampler, in.uv).rgb;
+        float luma = dot(albedo, float3(0.2126, 0.7152, 0.0722));
+        float chroma = length(albedo - float3(luma));
+        float colorMask = smoothstep(0.035, 0.16, chroma);
+        float saturation = mix(1.12, 2.05, colorMask);
+        albedo = clamp(mix(float3(luma), albedo, saturation), 0.0, 1.0);
+        albedo = clamp(mix(albedo, mix(float3(0.5), albedo, 1.12), colorMask), 0.0, 1.0);
+        float metallic = clamp(metallicTexture.sample(texSampler, in.uv).r * 0.25, 0.0, 0.12);
+        float roughness = clamp(roughnessTexture.sample(texSampler, in.uv).r, 0.35, 0.75);
+
         float3 V = normalize(u.viewPos - in.worldPos);
-        float3 L = normalize(u.lightPos - in.worldPos);
-        float3 H = normalize(L + V);
-        float ambient = 0.18;
-        float diff = max(dot(N, L), 0.0);
-        float diffuse = 0.20 + 0.75 * diff;
-        float spec = pow(max(dot(N, H), 0.0), 64.0);
-        float specular = 0.24 * spec;
-        float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-        float rim = 0.25 * fresnel;
-        float lighting = ambient + diffuse + specular + rim;
-        float4 texColor = skinTexture.sample(texSampler, in.uv);
-        float3 lit = texColor.rgb * lighting;
-        return float4(lit, texColor.a);
+        float3 shadeN = macroN;
+        float3 specN = normalize(mix(macroN, detailN, 0.35));
+        float3 keyDir = normalize(u.lightPos - in.worldPos);
+        float3 fillDir = normalize(float3(0.55, 0.42, 0.75));
+        float3 rimDir = normalize(float3(0.45, 0.25, -0.85));
+        float3 H = normalize(keyDir + V);
+
+        float key = max(dot(shadeN, keyDir), 0.0);
+        float fill = max(dot(shadeN, fillDir), 0.0);
+        float rimLight = max(dot(shadeN, rimDir), 0.0);
+        float wrapKey = key * 0.70 + 0.30;
+
+        float3 keyTint = float3(1.0, 0.91, 0.72);
+        float3 F0 = mix(float3(0.04), albedo, metallic);
+        float3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(H, V), 0.0), 5.0);
+        float specPower = mix(96.0, 28.0, roughness);
+        float specDot = max(dot(specN, H), 0.0);
+        float macroSpecDot = max(dot(shadeN, H), 0.0);
+        float spec = pow(specDot, specPower) * mix(0.24, 0.10, roughness);
+        float clearCoat = pow(macroSpecDot, 36.0) * 1.05;
+        float broadHotspot = smoothstep(0.52, 0.98, macroSpecDot) * 0.34;
+        float fresnel = pow(1.0 - max(dot(shadeN, V), 0.0), 3.0);
+
+        float hemi = clamp(shadeN.y * 0.5 + 0.5, 0.0, 1.0);
+        float3 ambientSky = float3(0.86, 0.91, 1.0);
+        float3 ambientGround = float3(0.55, 0.50, 0.42);
+        float3 ambient = albedo * mix(ambientGround, ambientSky, hemi) * 0.64;
+
+        float3 diffuse = ambient + albedo * (1.16 * wrapKey + 0.42 * fill + 0.24 * key);
+        float3 specular = F * spec * 1.34;
+        float3 rim = float3(0.88, 0.94, 1.0) * (0.10 * rimLight + 0.14 * fresnel);
+        float3 visibleLight = keyTint * (clearCoat + broadHotspot);
+        float3 color = diffuse * (1.0 - metallic * 0.30) + specular + rim + visibleLight;
+
+        float facing = max(dot(shadeN, V), 0.0);
+        color *= 0.82 + 0.20 * smoothstep(0.05, 1.0, facing);
+
+        float litLuma = dot(color, float3(0.2126, 0.7152, 0.0722));
+        color = mix(float3(litLuma), color, 1.08);
+        color = clamp(color * 1.20, 0.0, 1.0);
+        color = pow(color, float3(1.0 / 2.2));
+
+        return float4(color, 1.0);
     }
 
-    vertex VertexOut groundVertex(VertexIn in [[stage_in]],
-                                  constant SceneUniforms &u [[buffer(1)]]) {
-        VertexOut out;
+    vertex SurfaceVertexOut groundVertex(SurfaceVertexIn in [[stage_in]],
+                                         constant SceneUniforms &u [[buffer(1)]]) {
+        SurfaceVertexOut out;
         float4 worldPos = u.model * float4(in.position, 1.0);
         out.position = u.projection * u.view * worldPos;
         out.worldPos = worldPos.xyz;
@@ -793,7 +1356,7 @@ final class MetalScene {
         return out;
     }
 
-    fragment float4 groundFragment(VertexOut in [[stage_in]],
+    fragment float4 groundFragment(SurfaceVertexOut in [[stage_in]],
                                    constant SceneUniforms &u [[buffer(1)]]) {
         float2 grid = abs(fract(in.worldPos.xz / 120.0) - 0.5);
         float line = smoothstep(0.0, 0.03, min(grid.x, grid.y));
@@ -830,15 +1393,12 @@ final class MetalScene {
         float2 uv;
     };
 
-    vertex ShadowVertexOut shadowVertex(VertexIn in [[stage_in]],
+    vertex ShadowVertexOut shadowVertex(SurfaceVertexIn in [[stage_in]],
                                         constant SceneUniforms &u [[buffer(1)]]) {
         ShadowVertexOut out;
-        float sq = u.squash;
-        float shadowScaleX = 1.0 + sq * 0.4;
-        float shadowScaleY = 1.0 - sq * 0.2;
-        float3 p = float3(in.position.x * shadowScaleX,
+        float3 p = float3(in.position.x,
                           0.0,
-                          in.position.y * shadowScaleY);
+                          in.position.y);
         float4 worldPos = u.model * float4(p, 1.0);
         out.position = u.projection * u.view * worldPos;
         out.uv = in.texCoord;
@@ -869,14 +1429,18 @@ private struct TankMapping {
     var maxX: Float
     var minZ: Float
     var maxZ: Float
+    var floorY: Float
+    var screenMidX: Float
+    var screenMinY: Float
 }
 
-/// Must be ≤ 256 bytes and aligned to 256 for Metal buffer requirements.
-/// We use MemoryLayout<SceneUniforms>.stride for buffer sizes (padded by Swift).
+/// Keep this trivially copyable; `setVertexBytes` / `setFragmentBytes` copy the
+/// exact Swift stride into Metal's transient constant buffer each frame.
 struct SceneUniforms {
     var projection: float4x4 = .init(1)
     var view:       float4x4 = .init(1)
     var model:      float4x4 = .init(1)
+    var localModel: float4x4 = .init(1)
     var lightPos:   SIMD3<Float> = .zero
     var _pad0:      Float = 0
     var viewPos:    SIMD3<Float> = .zero
@@ -914,6 +1478,16 @@ extension float4x4 {
             SIMD4<Float>(c, 0, -s, 0),
             SIMD4<Float>(0, 1, 0, 0),
             SIMD4<Float>(s, 0, c, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+    }
+
+    init(rotationZ angle: Float) {
+        let c = cos(angle), s = sin(angle)
+        self = .init(columns: (
+            SIMD4<Float>(c, s, 0, 0),
+            SIMD4<Float>(-s, c, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
     }
